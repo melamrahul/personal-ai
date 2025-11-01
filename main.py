@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import os, hashlib
 from dotenv import load_dotenv
@@ -21,7 +22,7 @@ index_name = "rag-learning-lite"
 if index_name not in [i.name for i in pc.list_indexes()]:
     pc.create_index(
         name=index_name,
-        dimension=1024,  # Cohere embedding dimension
+        dimension=1024,  # Cohere embed-english-v3.0 dimension
         metric="cosine",
         spec=ServerlessSpec(cloud="aws", region="us-east-1")
     )
@@ -35,27 +36,37 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can restrict this later
+    allow_origins=["*"],  # loosen for testing, tighten later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # -------------------------------
-# 4️⃣ Data model
+# 4️⃣ Serve your HTML (optional)
+# -------------------------------
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    if os.path.exists("index.html"):
+        with open("index.html", "r", encoding="utf-8") as f:
+            return f.read()
+    return "<h2>Backend running — try POST /learn or /ask</h2>"
+
+# -------------------------------
+# 5️⃣ Data model
 # -------------------------------
 class Message(BaseModel):
     text: str
 
 # -------------------------------
-# 5️⃣ Helper – get embedding from Cohere
+# 6️⃣ Helper – get embedding
 # -------------------------------
 def get_embedding(text: str):
     response = co.embed(texts=[text], model="embed-english-v3.0")
     return response.embeddings[0]
 
 # -------------------------------
-# 6️⃣ Learn endpoint
+# 7️⃣ Learn endpoint
 # -------------------------------
 @app.post("/learn")
 async def learn(data: Message):
@@ -63,7 +74,7 @@ async def learn(data: Message):
     if not text:
         return {"error": "No text provided"}
 
-    # Split into chunks
+    # Split text into 500-char chunks
     chunks = [text[i:i + 500] for i in range(0, len(text), 500)]
     vectors = []
 
@@ -80,7 +91,7 @@ async def learn(data: Message):
     return {"status": "learned_or_updated", "chunks_stored": len(chunks)}
 
 # -------------------------------
-# 7️⃣ Ask endpoint
+# 8️⃣ Ask endpoint
 # -------------------------------
 @app.post("/ask")
 async def ask(data: Message):
@@ -96,7 +107,6 @@ async def ask(data: Message):
 
     context = "\n".join([m.metadata["text"] for m in results.matches])
 
-    # Use Cohere chat model for answer synthesis
     prompt = f"""
     Use the following context to answer the question:
 
@@ -107,9 +117,10 @@ async def ask(data: Message):
     {question}
     """
 
+    # Use Cohere chat model correctly
     response = co.chat(
         model="command-r-plus",
-        message=prompt
+        message=prompt  # ✅ 'message' is correct param name
     )
 
     return {"answer": response.text.strip()}
