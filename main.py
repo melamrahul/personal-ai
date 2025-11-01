@@ -96,7 +96,6 @@ async def ask(data: Message):
 
     context = "\n".join([m.metadata["text"] for m in results.matches])
 
-    # Use Cohere generate model for answer synthesis
     prompt = f"""
     Use the following context to answer the question:
 
@@ -107,16 +106,16 @@ async def ask(data: Message):
     {question}
     """
 
-    response = co.generate(
+    # ✅ Updated call — use chat() instead of generate()
+    response = co.chat(
         model="command-r-plus",
-        prompt=prompt,
-        max_tokens=200,
-        temperature=0.7,
+        message=prompt
     )
 
-    return {"answer": response.generations[0].text.strip()}
+    return {"answer": response.text.strip()}
 
 # -------------------------------
 # ✅ Run locally:
 # python -m uvicorn main:app --host 0.0.0.0 --port 8000
 # -------------------------------
+
