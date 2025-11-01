@@ -13,7 +13,7 @@ load_dotenv()
 co = cohere.Client(os.getenv("COHERE_API_KEY"))
 
 # -------------------------------
-# 2️⃣ Initialize Pinecone (lightweight version)
+# 2️⃣ Initialize Pinecone
 # -------------------------------
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 index_name = "rag-learning-lite"
@@ -96,6 +96,7 @@ async def ask(data: Message):
 
     context = "\n".join([m.metadata["text"] for m in results.matches])
 
+    # Use Cohere chat model for answer synthesis
     prompt = f"""
     Use the following context to answer the question:
 
@@ -106,7 +107,6 @@ async def ask(data: Message):
     {question}
     """
 
-    # ✅ Updated call — use chat() instead of generate()
     response = co.chat(
         model="command-r-plus",
         message=prompt
@@ -118,4 +118,3 @@ async def ask(data: Message):
 # ✅ Run locally:
 # python -m uvicorn main:app --host 0.0.0.0 --port 8000
 # -------------------------------
-
