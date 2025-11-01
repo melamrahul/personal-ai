@@ -1,5 +1,8 @@
 fastapi
 uvicorn
 google-generativeai
-pinecone
+pinecone-client
+sentence-transformers
 python-dotenv
+python-multipart
+requests
