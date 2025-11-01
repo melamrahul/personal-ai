@@ -10,7 +10,7 @@ from pinecone import Pinecone, ServerlessSpec
 # 1️⃣ Load environment variables
 # -------------------------------
 load_dotenv()
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # -------------------------------
 # 2️⃣ Initialize Pinecone (lightweight version)
@@ -116,4 +116,5 @@ async def ask(data: Message):
 # ✅ Run locally:
 # python -m uvicorn main:app --host 0.0.0.0 --port 8000
 # -------------------------------
+
 
