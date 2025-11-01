@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 from pinecone import Pinecone, ServerlessSpec
-from fastapi.middleware.cors import CORSMiddleware
 
 # -------------------------------
 # 1️⃣ Load environment variables
@@ -19,7 +18,7 @@ load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # -------------------------------
-# 3️⃣ Initialize Pinecone (new SDK)
+# 3️⃣ Initialize Pinecone
 # -------------------------------
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 index_name = "rag-learning-demo"
@@ -29,7 +28,7 @@ existing_indexes = [i.name for i in pc.list_indexes()]
 if index_name not in existing_indexes:
     pc.create_index(
         name=index_name,
-        dimension=384,  # Must match embedding model dimension
+        dimension=384,
         metric="cosine",
         spec=ServerlessSpec(cloud="aws", region="us-east-1")
     )
@@ -38,37 +37,29 @@ if index_name not in existing_indexes:
 index = pc.Index(index_name)
 
 # -------------------------------
-# 4️⃣ Initialize Embedder Model
+# 4️⃣ Initialize Embedder
 # -------------------------------
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 # -------------------------------
-# 5️⃣ Initialize FastAPI App
+# 5️⃣ Initialize FastAPI
 # -------------------------------
 app = FastAPI()
 
-# Enable CORS (so frontend on XAMPP can access it)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can later restrict to ["http://localhost"]
+    allow_origins=["*"],  # You can later restrict this
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],  # for testing; later you can restrict to ["http://localhost"]
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
 
 # -------------------------------
 # 6️⃣ Data Models
 # -------------------------------
 class Query(BaseModel):
     question: str
+
 
 # -------------------------------
 # 7️⃣ Learning Endpoint
@@ -80,7 +71,7 @@ async def train(data: dict):
     if not text.strip():
         return {"error": "No text provided"}
 
-    chunks = [text[i:i+500] for i in range(0, len(text), 500)]
+    chunks = [text[i:i + 500] for i in range(0, len(text), 500)]
     embeddings = embedder.encode(chunks).tolist()
 
     vectors = [
@@ -91,6 +82,7 @@ async def train(data: dict):
     index.upsert(vectors=vectors)
     return {"status": "trained", "chunks_stored": len(chunks)}
 
+
 # -------------------------------
 # 8️⃣ Question Answering Endpoint
 # -------------------------------
@@ -98,15 +90,11 @@ async def train(data: dict):
 async def ask(query: Query):
     """Retrieve and answer questions based on learned data"""
     q_embed = embedder.encode(query.question).tolist()
-
-    # Query Pinecone for relevant chunks
     results = index.query(vector=q_embed, top_k=3, include_metadata=True)
-
-    # Combine retrieved context
     context = "\n".join([m["metadata"]["text"] for m in results["matches"]])
 
-    # Construct the prompt for Gemini
-    prompt = f"""Answer the question using the context below:
+    prompt = f"""
+    Answer the question using the context below:
     Context:
     {context}
 
@@ -114,14 +102,15 @@ async def ask(query: Query):
     {query.question}
     """
 
-    # Generate answer using Gemini
     model = genai.GenerativeModel("gemini-2.5-flash")
     response = model.generate_content(prompt)
-
     return {"answer": response.text}
 
+
 # -------------------------------
-# ✅ 9️⃣ Run Command (for reference)
+# ✅ 9️⃣ Run for Render
 # -------------------------------
-# Use this in your terminal:
-# python -m uvicorn main:app --reload --port 8000
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))  # Required for Render
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
