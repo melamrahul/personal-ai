@@ -1,9 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import os
+import os, hashlib
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 from pinecone import Pinecone, ServerlessSpec
 
@@ -11,106 +10,109 @@ from pinecone import Pinecone, ServerlessSpec
 # 1️⃣ Load environment variables
 # -------------------------------
 load_dotenv()
-
-# -------------------------------
-# 2️⃣ Configure Google Gemini API
-# -------------------------------
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
 # -------------------------------
-# 3️⃣ Initialize Pinecone
+# 2️⃣ Initialize Pinecone (lightweight version)
 # -------------------------------
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-index_name = "rag-learning-demo"
+index_name = "rag-learning-lite"
 
-# Create index if it doesn’t exist
-existing_indexes = [i.name for i in pc.list_indexes()]
-if index_name not in existing_indexes:
+if index_name not in [i.name for i in pc.list_indexes()]:
     pc.create_index(
         name=index_name,
-        dimension=384,
+        dimension=768,  # Gemini embedding dimension
         metric="cosine",
         spec=ServerlessSpec(cloud="aws", region="us-east-1")
     )
 
-# Connect to the index
 index = pc.Index(index_name)
 
 # -------------------------------
-# 4️⃣ Initialize Embedder
-# -------------------------------
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
-
-# -------------------------------
-# 5️⃣ Initialize FastAPI
+# 3️⃣ FastAPI App setup
 # -------------------------------
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can later restrict this
+    allow_origins=["*"],  # You can restrict this later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # -------------------------------
-# 6️⃣ Data Models
+# 4️⃣ Data model
 # -------------------------------
-class Query(BaseModel):
-    question: str
+class Message(BaseModel):
+    text: str
 
+# -------------------------------
+# 5️⃣ Helper – get embedding from Gemini
+# -------------------------------
+def get_embedding(text: str):
+    result = genai.embed_content(
+        model="models/embedding-001",
+        content=text,
+    )
+    return result["embedding"]
 
 # -------------------------------
-# 7️⃣ Learning Endpoint
+# 6️⃣ Learn endpoint
 # -------------------------------
-@app.post("/train")
-async def train(data: dict):
-    """Learn directly from input text"""
-    text = data.get("text", "")
-    if not text.strip():
+@app.post("/learn")
+async def learn(data: Message):
+    """Teach the AI from text directly via prompt."""
+    text = data.text.strip()
+    if not text:
         return {"error": "No text provided"}
 
+    # Split into chunks
     chunks = [text[i:i + 500] for i in range(0, len(text), 500)]
-    embeddings = embedder.encode(chunks).tolist()
+    vectors = []
 
-    vectors = [
-        {"id": f"chunk-{i}", "values": embeddings[i], "metadata": {"text": chunks[i]}}
-        for i in range(len(chunks))
-    ]
+    for chunk in chunks:
+        chunk_id = hashlib.md5(chunk.encode()).hexdigest()  # unique ID for smart updating
+        embedding = get_embedding(chunk)
+        vectors.append({
+            "id": chunk_id,
+            "values": embedding,
+            "metadata": {"text": chunk}
+        })
 
     index.upsert(vectors=vectors)
-    return {"status": "trained", "chunks_stored": len(chunks)}
-
+    return {"status": "learned_or_updated", "chunks": len(chunks)}
 
 # -------------------------------
-# 8️⃣ Question Answering Endpoint
+# 7️⃣ Ask endpoint
 # -------------------------------
 @app.post("/ask")
-async def ask(query: Query):
-    """Retrieve and answer questions based on learned data"""
-    q_embed = embedder.encode(query.question).tolist()
-    results = index.query(vector=q_embed, top_k=3, include_metadata=True)
-    context = "\n".join([m["metadata"]["text"] for m in results["matches"]])
+async def ask(data: Message):
+    """Ask a question based on learned memory."""
+    question = data.text.strip()
+    if not question:
+        return {"error": "No question provided"}
 
-    prompt = f"""
-    Answer the question using the context below:
-    Context:
+    q_embed = get_embedding(question)
+    results = index.query(vector=q_embed, top_k=3, include_metadata=True)
+
+    if not results.matches:
+        return {"answer": "I don’t know yet. Try teaching me first with 'learn'."}
+
+    context = "\n".join([m.metadata["text"] for m in results.matches])
+
+    prompt = f"""Use the following context to answer:
     {context}
 
-    Question:
-    {query.question}
+    Question: {question}
     """
 
     model = genai.GenerativeModel("gemini-2.5-flash")
     response = model.generate_content(prompt)
+
     return {"answer": response.text}
 
-
 # -------------------------------
-# ✅ 9️⃣ Run for Render
+# ✅ Run locally:
+# python -m uvicorn main:app --host 0.0.0.0 --port 8000
 # -------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))  # Required for Render
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
