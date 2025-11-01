@@ -30,7 +30,7 @@ if index_name not in [i.name for i in pc.list_indexes()]:
 index = pc.Index(index_name)
 
 # -------------------------------
-# 3️⃣ FastAPI App setup
+# 3️⃣ FastAPI setup
 # -------------------------------
 app = FastAPI()
 
@@ -43,7 +43,7 @@ app.add_middleware(
 )
 
 # -------------------------------
-# 4️⃣ Serve your HTML (optional)
+# 4️⃣ Serve HTML (optional)
 # -------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -61,8 +61,12 @@ class Message(BaseModel):
 # -------------------------------
 # 6️⃣ Helper – get embedding
 # -------------------------------
-def get_embedding(text: str):
-    response = co.embed(texts=[text], model="embed-english-v3.0")
+def get_embedding(text: str, input_type: str = "search_document"):
+    response = co.embed(
+        texts=[text],
+        model="embed-english-v3.0",
+        input_type=input_type  # REQUIRED by Cohere v3
+    )
     return response.embeddings[0]
 
 # -------------------------------
@@ -80,7 +84,7 @@ async def learn(data: Message):
 
     for chunk in chunks:
         chunk_id = hashlib.md5(chunk.encode()).hexdigest()
-        embedding = get_embedding(chunk)
+        embedding = get_embedding(chunk, input_type="search_document")
         vectors.append({
             "id": chunk_id,
             "values": embedding,
@@ -99,7 +103,7 @@ async def ask(data: Message):
     if not question:
         return {"error": "No question provided"}
 
-    q_embed = get_embedding(question)
+    q_embed = get_embedding(question, input_type="search_query")
     results = index.query(vector=q_embed, top_k=3, include_metadata=True)
 
     if not results.matches:
@@ -108,7 +112,7 @@ async def ask(data: Message):
     context = "\n".join([m.metadata["text"] for m in results.matches])
 
     prompt = f"""
-    Use the following context to answer the question:
+    Use the following context to answer the question.
 
     Context:
     {context}
@@ -117,15 +121,14 @@ async def ask(data: Message):
     {question}
     """
 
-    # Use Cohere chat model correctly
     response = co.chat(
         model="command-r-plus",
-        message=prompt  # ✅ 'message' is correct param name
+        message=prompt
     )
 
     return {"answer": response.text.strip()}
 
 # -------------------------------
 # ✅ Run locally:
-# python -m uvicorn main:app --host 0.0.0.0 --port 8000
+# uvicorn main:app --host 0.0.0.0 --port 8000
 # -------------------------------
