@@ -3,14 +3,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os, hashlib
 from dotenv import load_dotenv
-import google.generativeai as genai
+import cohere
 from pinecone import Pinecone, ServerlessSpec
 
 # -------------------------------
 # 1️⃣ Load environment variables
 # -------------------------------
 load_dotenv()
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+co = cohere.Client(os.getenv("COHERE_API_KEY"))
 
 # -------------------------------
 # 2️⃣ Initialize Pinecone (lightweight version)
@@ -21,7 +21,7 @@ index_name = "rag-learning-lite"
 if index_name not in [i.name for i in pc.list_indexes()]:
     pc.create_index(
         name=index_name,
-        dimension=768,  # Gemini embedding dimension
+        dimension=1024,  # Cohere embedding dimension
         metric="cosine",
         spec=ServerlessSpec(cloud="aws", region="us-east-1")
     )
@@ -48,21 +48,17 @@ class Message(BaseModel):
     text: str
 
 # -------------------------------
-# 5️⃣ Helper – get embedding from Gemini
+# 5️⃣ Helper – get embedding from Cohere
 # -------------------------------
 def get_embedding(text: str):
-    result = genai.embed_content(
-        model="models/embedding-001",
-        content=text,
-    )
-    return result["embedding"]
+    response = co.embed(texts=[text], model="embed-english-v3.0")
+    return response.embeddings[0]
 
 # -------------------------------
 # 6️⃣ Learn endpoint
 # -------------------------------
 @app.post("/learn")
 async def learn(data: Message):
-    """Teach the AI from text directly via prompt."""
     text = data.text.strip()
     if not text:
         return {"error": "No text provided"}
@@ -72,7 +68,7 @@ async def learn(data: Message):
     vectors = []
 
     for chunk in chunks:
-        chunk_id = hashlib.md5(chunk.encode()).hexdigest()  # unique ID for smart updating
+        chunk_id = hashlib.md5(chunk.encode()).hexdigest()
         embedding = get_embedding(chunk)
         vectors.append({
             "id": chunk_id,
@@ -81,14 +77,13 @@ async def learn(data: Message):
         })
 
     index.upsert(vectors=vectors)
-    return {"status": "learned_or_updated", "chunks": len(chunks)}
+    return {"status": "learned_or_updated", "chunks_stored": len(chunks)}
 
 # -------------------------------
 # 7️⃣ Ask endpoint
 # -------------------------------
 @app.post("/ask")
 async def ask(data: Message):
-    """Ask a question based on learned memory."""
     question = data.text.strip()
     if not question:
         return {"error": "No question provided"}
@@ -97,24 +92,31 @@ async def ask(data: Message):
     results = index.query(vector=q_embed, top_k=3, include_metadata=True)
 
     if not results.matches:
-        return {"answer": "I don’t know yet. Try teaching me first with 'learn'."}
+        return {"answer": "I don’t know yet. Try teaching me first with /learn."}
 
     context = "\n".join([m.metadata["text"] for m in results.matches])
 
-    prompt = f"""Use the following context to answer:
+    # Use Cohere generate model for answer synthesis
+    prompt = f"""
+    Use the following context to answer the question:
+
+    Context:
     {context}
 
-    Question: {question}
+    Question:
+    {question}
     """
 
-    model = genai.GenerativeModel("gemini-2.5-flash")
-    response = model.generate_content(prompt)
+    response = co.generate(
+        model="command-r-plus",
+        prompt=prompt,
+        max_tokens=200,
+        temperature=0.7,
+    )
 
-    return {"answer": response.text}
+    return {"answer": response.generations[0].text.strip()}
 
 # -------------------------------
 # ✅ Run locally:
 # python -m uvicorn main:app --host 0.0.0.0 --port 8000
 # -------------------------------
-
-
