@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
-import os, hashlib, traceback
+import os, hashlib, traceback, uuid
 from dotenv import load_dotenv
 import cohere
 from pinecone import Pinecone, ServerlessSpec
@@ -106,7 +106,7 @@ def get_embedding(text: str, input_type: str = "search_document"):
     return response.embeddings[0]
 
 # -------------------------------
-# 8️⃣ Learn endpoint
+# 8️⃣ Learn endpoint with deduplication
 # -------------------------------
 @app.post("/learn")
 async def learn(data: Message):
@@ -117,18 +117,71 @@ async def learn(data: Message):
     # Split text into 500-char chunks
     chunks = [text[i:i + 500] for i in range(0, len(text), 500)]
     vectors = []
+    updated_count = 0
+    stored_count = 0
 
     for chunk in chunks:
-        chunk_id = hashlib.md5(chunk.encode()).hexdigest()
+        # Get embedding for similarity check
         embedding = get_embedding(chunk, input_type="search_document")
+        
+        # Check for similar existing content (similarity threshold: 0.80 = 80% similar)
+        duplicate_found = False
+        try:
+            similar_results = index.query(
+                vector=embedding,
+                top_k=3,
+                include_metadata=True
+            )
+            
+            matches = getattr(similar_results, "matches", None) or similar_results.get("matches", [])
+            
+            # Check all top matches for duplicates
+            if matches and len(matches) > 0:
+                for match in matches:
+                    similarity_score = match.get("score", 0) if isinstance(match, dict) else getattr(match, "score", 0)
+                    
+                    # For Pinecone cosine similarity: higher score = more similar
+                    # Score range is typically -1 to 1, where 1 is identical
+                    if similarity_score > 0.80:
+                        # Delete the old duplicate
+                        old_id = match.get("id") if isinstance(match, dict) else getattr(match, "id")
+                        old_text = match.get("metadata", {}).get("text", "") if isinstance(match, dict) else getattr(match.metadata, "text", "")
+                        
+                        index.delete(ids=[old_id])
+                        updated_count += 1
+                        duplicate_found = True
+                        print(f"🔄 Deleted duplicate (similarity: {similarity_score:.3f})")
+                        print(f"   Old: {old_text[:50]}...")
+                        print(f"   New: {chunk[:50]}...")
+        
+        except Exception as e:
+            print(f"⚠️ Similarity check failed: {e}")
+            # Continue with storage even if check fails
+        
+        # Generate unique ID and store new content
+        chunk_id = str(uuid.uuid4())  # Use UUID instead of MD5 hash
+        
         vectors.append({
             "id": chunk_id,
             "values": embedding,
             "metadata": {"text": chunk}
         })
+        stored_count += 1
 
-    index.upsert(vectors=vectors)
-    return {"status": "learned_or_updated", "chunks_stored": len(chunks)}
+    # Upsert all vectors at once
+    if vectors:
+        index.upsert(vectors=vectors)
+
+    response = {
+        "status": "success",
+        "chunks_stored": stored_count,
+    }
+    
+    if updated_count > 0:
+        response["chunks_updated"] = updated_count
+        response["message"] = f"Updated {updated_count} similar entries"
+    
+    return response
 
 # -------------------------------
 # 9️⃣ Ask endpoint
@@ -145,7 +198,7 @@ async def ask(data: Message):
     matches = getattr(results, "matches", None) or results.get("matches", [])
 
     if not matches:
-        return {"answer": "I don’t know yet. Try teaching me first with /learn."}
+        return {"answer": "I don't know yet. Try teaching me first with /learn."}
 
     # Extract text context
     context = "\n".join([
