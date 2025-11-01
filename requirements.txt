@@ -1,9 +1,7 @@
 fastapi
 uvicorn
-google-generativeai
+cohere
 pinecone
-sentence-transformers
 python-dotenv
 python-multipart
 requests
-
