@@ -315,6 +315,11 @@ async def ask(data: AskRequest):
             
             context = "\n\n".join(context_parts)
 
+            # Check if we need web search even with personal knowledge
+            needs_current_info = any(keyword in question.lower() for keyword in [
+                "current", "now", "today", "latest", "recent", "2024", "2025"
+            ])
+            
             prompt = f"""You are a helpful AI assistant. Answer the following question using the personal knowledge provided AND your general knowledge.
 
 Question: {question}
@@ -323,18 +328,20 @@ Personal Knowledge from the user's database:
 {context}
 
 Instructions:
-- First, use the personal knowledge if it's directly relevant to the question
-- You can also supplement with your general knowledge to provide a complete answer
-- Be clear about what comes from personal data vs general knowledge if relevant
-- Provide a comprehensive, accurate answer
+- Use the personal knowledge if it's directly relevant to the question
+- Supplement with your general knowledge to provide a complete answer
+- Provide a comprehensive, accurate, and up-to-date answer
 - Be conversational and helpful
+- Don't mention knowledge cutoffs or date limitations - just answer directly
 
 Answer:"""
 
             chat_response = co.chat(
                 model="command-r-plus-08-2024", 
                 message=prompt,
-                temperature=0.5
+                temperature=0.5,
+                # Enable web search if question seems to need current info
+                connectors=[{"id": "web-search"}] if needs_current_info else None
             )
 
             answer_text = getattr(chat_response, "text", str(chat_response)).strip()
@@ -358,26 +365,56 @@ Answer:"""
                     "success": True
                 }
             
-            # Use Cohere's general knowledge directly
-            prompt = f"""You are a helpful AI assistant. Please answer the following question using your general knowledge.
+            # Use Cohere's general knowledge with enhanced prompting
+            # Check if question needs current/recent information
+            needs_current_info = any(keyword in question.lower() for keyword in [
+                "current", "now", "today", "latest", "recent", "2024", "2025",
+                "who is", "what is the", "cm of", "pm of", "president of", 
+                "ceo of", "minister", "governor", "chief minister", "prime minister"
+            ])
+            
+            if needs_current_info:
+                prompt = f"""You are a helpful AI assistant with access to current information. Answer this question with the most up-to-date information available.
 
 Question: {question}
 
 Instructions:
-- Provide an accurate, helpful answer based on your training
-- Be conversational and clear
-- If you're not sure, say so
-- Keep the answer concise but complete
+- Provide the CURRENT, accurate answer as of 2024-2025
+- If this is about a political position (PM, CM, President, etc.), provide who currently holds that position
+- Be confident and direct - don't mention knowledge limitations
+- Keep it concise and accurate
+- If you truly don't know current information, make your best inference based on recent patterns
+
+Answer:"""
+            else:
+                prompt = f"""You are a helpful AI assistant. Answer this question clearly and accurately.
+
+Question: {question}
+
+Instructions:
+- Provide a clear, accurate answer
+- Be conversational and helpful
+- Keep it concise but complete
+- Answer confidently without mentioning limitations
 
 Answer:"""
 
-            chat_response = co.chat(
-                model="command-r-plus-08-2024", 
-                message=prompt,
-                temperature=0.7,
-                # Enable web search for current information if needed
-                connectors=[{"id": "web-search"}] if "current" in question.lower() or "latest" in question.lower() or "today" in question.lower() else None
-            )
+            try:
+                # Try with web search connector first
+                chat_response = co.chat(
+                    model="command-r-plus-08-2024", 
+                    message=prompt,
+                    temperature=0.3,
+                    connectors=[{"id": "web-search"}] if needs_current_info else None
+                )
+            except Exception as e:
+                print(f"⚠️ Web search failed, trying without: {e}")
+                # Fallback without web search
+                chat_response = co.chat(
+                    model="command-r-plus-08-2024", 
+                    message=prompt,
+                    temperature=0.3
+                )
 
             answer_text = getattr(chat_response, "text", str(chat_response)).strip()
 
