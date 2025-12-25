@@ -100,6 +100,7 @@ class LearnRequest(BaseModel):
 class AskRequest(BaseModel):
     text: str
     top_k: Optional[int] = 5  # Retrieve more context
+    use_general_knowledge: Optional[bool] = True  # NEW: Allow general knowledge
 
 class ForgetRequest(BaseModel):
     query: Optional[str] = None  # Specific content to forget
@@ -262,13 +263,15 @@ async def learn(data: LearnRequest):
     return response
 
 # -------------------------------
-# 8️⃣ Ask endpoint - IMPROVED
+# 8️⃣ Ask endpoint - HYBRID APPROACH (Personal + General Knowledge)
 # -------------------------------
 @app.post("/ask")
 async def ask(data: AskRequest):
     """
-    Answer questions using learned knowledge.
-    Returns clear indication if answer is from learned data or not.
+    Answer questions using BOTH learned knowledge AND general knowledge.
+    - First checks personal learned data
+    - If no relevant personal data found, uses Cohere's general knowledge
+    - If personal data is found, augments it with general knowledge
     """
     question = data.text.strip()
     if not question:
@@ -277,10 +280,9 @@ async def ask(data: AskRequest):
     print(f"\n❓ Question: {question}")
 
     try:
-        # Get query embedding
+        # Step 1: Try to find relevant personal knowledge
         q_embed = get_embedding(question, input_type="search_query")
         
-        # Search for relevant content
         results = index.query(
             vector=q_embed, 
             top_k=data.top_k, 
@@ -289,72 +291,104 @@ async def ask(data: AskRequest):
 
         matches = getattr(results, "matches", []) or results.get("matches", [])
 
-        if not matches:
-            return {
-                "answer": "I don't have any learned knowledge yet. Please teach me something using the /learn endpoint first!",
-                "source": "none",
-                "confidence": 0,
-                "success": True
-            }
-
-        # Check relevance of best match
-        best_score = matches[0].get("score", 0) if isinstance(matches[0], dict) else getattr(matches[0], "score", 0)
+        # Determine if we have relevant personal knowledge
+        has_personal_knowledge = False
+        best_score = 0
         
-        print(f"🔍 Found {len(matches)} matches, best score: {best_score:.3f}")
+        if matches:
+            best_score = matches[0].get("score", 0) if isinstance(matches[0], dict) else getattr(matches[0], "score", 0)
+            # Consider knowledge relevant if score > 0.5 (50% similarity)
+            has_personal_knowledge = best_score > 0.5
+        
+        print(f"🔍 Personal knowledge check: {len(matches)} matches, best score: {best_score:.3f}, relevant: {has_personal_knowledge}")
 
-        # If best match is low quality, indicate uncertainty
-        if best_score < 0.3:
-            return {
-                "answer": "I found some information but it doesn't seem very relevant to your question. Could you rephrase or teach me more about this topic?",
-                "source": "low_confidence",
-                "confidence": best_score,
-                "success": True
-            }
-
-        # Extract context from matches
-        context_parts = []
-        for i, match in enumerate(matches):
-            score = match.get("score", 0) if isinstance(match, dict) else getattr(match, "score", 0)
-            text = match.get("metadata", {}).get("text", "") if isinstance(match, dict) else getattr(match, "metadata", {}).get("text", "")
+        # Step 2: Decide on response strategy
+        if has_personal_knowledge:
+            # Use personal knowledge (RAG approach)
+            context_parts = []
+            for i, match in enumerate(matches):
+                score = match.get("score", 0) if isinstance(match, dict) else getattr(match, "score", 0)
+                text = match.get("metadata", {}).get("text", "") if isinstance(match, dict) else getattr(match, "metadata", {}).get("text", "")
+                
+                if score > 0.3:  # Only use reasonably relevant matches
+                    context_parts.append(f"[Personal Knowledge {i+1}, relevance: {score:.2f}]\n{text}")
             
-            if score > 0.2:  # Only use reasonably relevant matches
-                context_parts.append(f"[Context {i+1}, relevance: {score:.2f}]\n{text}")
-        
-        context = "\n\n".join(context_parts)
+            context = "\n\n".join(context_parts)
 
-        # Create focused prompt
-        prompt = f"""You are a helpful assistant answering based on learned knowledge.
+            prompt = f"""You are a helpful AI assistant. Answer the following question using the personal knowledge provided AND your general knowledge.
 
 Question: {question}
 
-Relevant information from my knowledge base:
+Personal Knowledge from the user's database:
 {context}
 
 Instructions:
-- Answer the question directly and clearly using the context provided
-- If the context fully answers the question, be confident
-- If the context only partially answers it, acknowledge what you know and what you're unsure about
-- Be concise but complete
-- Don't mention "the context" - just answer naturally as if this is your knowledge
+- First, use the personal knowledge if it's directly relevant to the question
+- You can also supplement with your general knowledge to provide a complete answer
+- Be clear about what comes from personal data vs general knowledge if relevant
+- Provide a comprehensive, accurate answer
+- Be conversational and helpful
 
 Answer:"""
 
-        # Get response from Cohere
-        chat_response = co.chat(
-            model="command-r-plus-08-2024", 
-            message=prompt,
-            temperature=0.3  # Lower temperature for more factual responses
-        )
+            chat_response = co.chat(
+                model="command-r-plus-08-2024", 
+                message=prompt,
+                temperature=0.5
+            )
 
-        answer_text = getattr(chat_response, "text", str(chat_response)).strip()
+            answer_text = getattr(chat_response, "text", str(chat_response)).strip()
 
-        return {
-            "answer": answer_text,
-            "source": "learned_knowledge",
-            "confidence": best_score,
-            "matches_found": len(matches),
-            "success": True
-        }
+            return {
+                "answer": answer_text,
+                "source": "personal_knowledge",
+                "confidence": best_score,
+                "matches_found": len(matches),
+                "success": True,
+                "note": "Answer based on your learned data"
+            }
+        
+        else:
+            # No relevant personal knowledge - use general knowledge
+            if not data.use_general_knowledge:
+                return {
+                    "answer": "I don't have relevant information in my learned knowledge base about this topic. You can enable general knowledge mode or teach me about it using /learn.",
+                    "source": "none",
+                    "confidence": best_score,
+                    "success": True
+                }
+            
+            # Use Cohere's general knowledge directly
+            prompt = f"""You are a helpful AI assistant. Please answer the following question using your general knowledge.
+
+Question: {question}
+
+Instructions:
+- Provide an accurate, helpful answer based on your training
+- Be conversational and clear
+- If you're not sure, say so
+- Keep the answer concise but complete
+
+Answer:"""
+
+            chat_response = co.chat(
+                model="command-r-plus-08-2024", 
+                message=prompt,
+                temperature=0.7,
+                # Enable web search for current information if needed
+                connectors=[{"id": "web-search"}] if "current" in question.lower() or "latest" in question.lower() or "today" in question.lower() else None
+            )
+
+            answer_text = getattr(chat_response, "text", str(chat_response)).strip()
+
+            return {
+                "answer": answer_text,
+                "source": "general_knowledge",
+                "confidence": 0,
+                "matches_found": 0,
+                "success": True,
+                "note": "Answer from general AI knowledge (not your personal data)"
+            }
 
     except Exception as e:
         print(f"❌ Error during ask: {e}")
@@ -365,7 +399,7 @@ Answer:"""
         }
 
 # -------------------------------
-# 9️⃣ Forget endpoint - NEW
+# 9️⃣ Forget endpoint
 # -------------------------------
 @app.post("/forget")
 async def forget(data: ForgetRequest):
@@ -450,7 +484,7 @@ async def forget(data: ForgetRequest):
         }
 
 # -------------------------------
-# 🔟 Stats endpoint - NEW
+# 🔟 Stats endpoint
 # -------------------------------
 @app.get("/stats")
 async def get_stats():
@@ -473,7 +507,7 @@ async def get_stats():
         }
 
 # -------------------------------
-# 1️⃣1️⃣ List learned content - NEW
+# 1️⃣1️⃣ List learned content
 # -------------------------------
 @app.get("/list")
 async def list_knowledge():
@@ -526,7 +560,7 @@ async def root():
     <head>
         <title>RAG Learning System</title>
         <style>
-            body { font-family: Arial; max-width: 800px; margin: 50px auto; padding: 20px; }
+            body { font-family: Arial; max-width: 900px; margin: 50px auto; padding: 20px; }
             h1 { color: #333; }
             .section { margin: 30px 0; padding: 20px; border: 1px solid #ddd; border-radius: 8px; }
             textarea { width: 100%; min-height: 100px; padding: 10px; font-size: 14px; }
@@ -537,21 +571,40 @@ async def root():
                        border-radius: 4px; white-space: pre-wrap; }
             .error { background: #f8d7da; color: #721c24; }
             .success { background: #d4edda; color: #155724; }
+            .info-box { background: #d1ecf1; border-left: 4px solid #0c5460; padding: 15px; margin: 20px 0; }
+            .source-badge { display: inline-block; padding: 5px 10px; border-radius: 12px; 
+                           font-size: 12px; font-weight: bold; margin: 5px 0; }
+            .badge-personal { background: #28a745; color: white; }
+            .badge-general { background: #17a2b8; color: white; }
+            .badge-none { background: #6c757d; color: white; }
         </style>
     </head>
     <body>
         <h1>🧠 RAG Learning System</h1>
         
+        <div class="info-box">
+            <strong>💡 How it works:</strong><br>
+            • <strong>Personal Mode:</strong> I'll answer from what you teach me via /learn<br>
+            • <strong>General Mode:</strong> I'll answer worldly questions using AI knowledge<br>
+            • <strong>Hybrid:</strong> I combine both for the best answers!
+        </div>
+        
         <div class="section">
-            <h2>📚 Teach Me</h2>
-            <textarea id="learnText" placeholder="Enter information to teach me..."></textarea>
+            <h2>📚 Teach Me (Personal Knowledge)</h2>
+            <textarea id="learnText" placeholder="Enter information to teach me...
+
+Example: 'My favorite color is purple. I work at Acme Corp as a software engineer.'"></textarea>
             <button onclick="learn()">Learn</button>
             <div id="learnResponse" class="response" style="display:none;"></div>
         </div>
         
         <div class="section">
-            <h2>❓ Ask Me</h2>
-            <textarea id="askText" placeholder="Ask me a question..."></textarea>
+            <h2>❓ Ask Me Anything</h2>
+            <textarea id="askText" placeholder="Ask me anything - about what you taught me OR general questions...
+
+Personal: 'What's my favorite color?'
+General: 'What is the capital of France?'
+Hybrid: 'How can I use my favorite color in web design?'"></textarea>
             <button onclick="ask()">Ask</button>
             <div id="askResponse" class="response" style="display:none;"></div>
         </div>
@@ -565,7 +618,7 @@ async def root():
         </div>
         
         <div class="section">
-            <h2>📊 Stats</h2>
+            <h2>📊 Stats & Management</h2>
             <button onclick="getStats()">Get Stats</button>
             <button onclick="listKnowledge()">List Knowledge</button>
             <div id="statsResponse" class="response" style="display:none;"></div>
@@ -605,11 +658,30 @@ async def root():
                     const res = await fetch('/ask', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({text})
+                        body: JSON.stringify({text, use_general_knowledge: true})
                     });
                     const data = await res.json();
+                    
                     resp.className = data.success ? 'response success' : 'response error';
-                    resp.textContent = data.answer || JSON.stringify(data, null, 2);
+                    
+                    // Display answer with source badge
+                    let badgeClass = 'badge-none';
+                    let badgeText = 'No Data';
+                    if (data.source === 'personal_knowledge') {
+                        badgeClass = 'badge-personal';
+                        badgeText = '📚 Personal Knowledge';
+                    } else if (data.source === 'general_knowledge') {
+                        badgeClass = 'badge-general';
+                        badgeText = '🌍 General Knowledge';
+                    }
+                    
+                    resp.innerHTML = `
+                        <div class="source-badge ${badgeClass}">${badgeText}</div>
+                        <div style="margin-top: 10px;"><strong>Answer:</strong></div>
+                        <div style="margin-top: 10px;">${data.answer || 'No answer'}</div>
+                        ${data.confidence ? `<div style="margin-top: 10px; font-size: 12px; color: #666;">Confidence: ${(data.confidence * 100).toFixed(1)}%</div>` : ''}
+                        ${data.note ? `<div style="margin-top: 10px; font-size: 12px; font-style: italic; color: #666;">${data.note}</div>` : ''}
+                    `;
                 } catch(e) {
                     resp.className = 'response error';
                     resp.textContent = 'Error: ' + e.message;
@@ -642,7 +714,7 @@ async def root():
             }
             
             async function forgetAll() {
-                if (!confirm('Are you sure you want to forget EVERYTHING?')) return;
+                if (!confirm('Are you sure you want to forget EVERYTHING? This cannot be undone!')) return;
                 
                 const resp = document.getElementById('forgetResponse');
                 resp.style.display = 'block';
