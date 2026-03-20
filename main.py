@@ -25,7 +25,7 @@ co = cohere.Client(COHERE_API_KEY)
 # 2️⃣ Initialize Pinecone
 # -------------------------------
 pc = Pinecone(api_key=PINECONE_API_KEY)
-index_name = "rag-learning-lite"
+index_name = "personal-ai"
 expected_dim = 1024
 
 # Ensure index exists with correct dimensions
