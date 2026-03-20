@@ -812,9 +812,9 @@ Hybrid: 'How can I use my favorite color in web design?'"></textarea>
 # -------------------------------
 # ✅ Health check
 # -------------------------------
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    return {"status": "healthy", "service": "RAG Learning System"}
+    return {"ok": True}
 
 # -------------------------------
 # Run: python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
