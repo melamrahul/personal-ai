@@ -298,7 +298,7 @@ async def ask(data: AskRequest):
         if matches:
             best_score = matches[0].get("score", 0) if isinstance(matches[0], dict) else getattr(matches[0], "score", 0)
             # Consider knowledge relevant if score > 0.5 (50% similarity)
-            has_personal_knowledge = best_score > 0.5
+            has_personal_knowledge = best_score > 0.25
         
         print(f"🔍 Personal knowledge check: {len(matches)} matches, best score: {best_score:.3f}, relevant: {has_personal_knowledge}")
 
@@ -310,7 +310,7 @@ async def ask(data: AskRequest):
                 score = match.get("score", 0) if isinstance(match, dict) else getattr(match, "score", 0)
                 text = match.get("metadata", {}).get("text", "") if isinstance(match, dict) else getattr(match, "metadata", {}).get("text", "")
                 
-                if score > 0.3:  # Only use reasonably relevant matches
+                if score > 0.2:  # Only use reasonably relevant matches
                     context_parts.append(f"[Personal Knowledge {i+1}, relevance: {score:.2f}]\n{text}")
             
             context = "\n\n".join(context_parts)
