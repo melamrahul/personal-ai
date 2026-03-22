@@ -7,8 +7,8 @@ import os, traceback, uuid, time, re
 from datetime import datetime
 from dotenv import load_dotenv
 import cohere
-import psycopg2
-import psycopg2.extras
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 import httpx
 import urllib.parse
 
@@ -22,12 +22,10 @@ from boto3.dynamodb.conditions import Key
 load_dotenv()
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 
-# PostgreSQL / pgvector — set these 5 vars on Render dashboard
-PG_HOST     = os.getenv("PG_HOST",     "localhost")
-PG_PORT     = os.getenv("PG_PORT",     "5432")
-PG_DB       = os.getenv("PG_DB",       "personalai")
-PG_USER     = os.getenv("PG_USER",     "postgres")
-PG_PASSWORD = os.getenv("PG_PASSWORD", "")
+# Qdrant Cloud — set these 2 vars on Render dashboard
+QDRANT_URL    = os.getenv("QDRANT_URL",    "")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
+QDRANT_COLLECTION = "personal_knowledge"
 
 # DynamoDB — set these on Render dashboard (Environment tab)
 AWS_REGION   = os.getenv("AWS_REGION",   "us-east-1")
@@ -43,40 +41,29 @@ if not COHERE_API_KEY:
 co = cohere.Client(COHERE_API_KEY)
 
 # -------------------------------
-# 2️⃣ Initialize PostgreSQL / pgvector
+# 2️⃣ Initialize Qdrant
 # -------------------------------
-def _pg():
-    """Return a fresh PostgreSQL connection."""
-    return psycopg2.connect(
-        host=PG_HOST, port=int(PG_PORT), dbname=PG_DB,
-        user=PG_USER, password=PG_PASSWORD, connect_timeout=10,
-    )
+def _qdrant() -> QdrantClient:
+    """Return a Qdrant client connected to Qdrant Cloud."""
+    return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
-def _init_pg():
-    """Create the knowledge table + ivfflat vector index on first startup."""
+def _init_qdrant():
+    """Create the knowledge collection if it does not exist."""
     try:
-        conn = _pg(); cur = conn.cursor()
-        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS knowledge (
-                id        TEXT PRIMARY KEY,
-                content   TEXT NOT NULL,
-                embedding vector(1024) NOT NULL,
-                timestamp TEXT,
-                length    INTEGER
-            );
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS knowledge_vec_idx
-            ON knowledge USING ivfflat (embedding vector_cosine_ops)
-            WITH (lists = 100);
-        """)
-        conn.commit(); cur.close(); conn.close()
-        print("✅ pgvector table ready")
+        client = _qdrant()
+        existing = [c.name for c in client.get_collections().collections]
+        if QDRANT_COLLECTION not in existing:
+            client.create_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config=VectorParams(size=1024, distance=Distance.COSINE),
+            )
+            print(f"✅ Qdrant collection '{QDRANT_COLLECTION}' created")
+        else:
+            print(f"✅ Qdrant collection '{QDRANT_COLLECTION}' ready")
     except Exception as e:
-        print(f"⚠️ pgvector init: {e}")
+        print(f"⚠️ Qdrant init: {e}")
 
-_init_pg()
+_init_qdrant()
 
 # ── DynamoDB lazy init ────────────────────────────────────────────────────────
 _dynamo_resource = None
@@ -343,42 +330,53 @@ async def learn(data: LearnRequest):
     print(f"\n📚 Learning {len(chunks)} chunks...")
 
     try:
-        conn = _pg(); cur = conn.cursor()
+        client = _qdrant()
         for idx, chunk in enumerate(chunks):
             try:
                 embedding = get_embedding(chunk, input_type="search_document")
-                vec_str   = "[" + ",".join(str(x) for x in embedding) + "]"
-                cur.execute("""
-                    SELECT id, content, 1-(embedding <=> %s::vector) AS sim
-                    FROM knowledge ORDER BY embedding <=> %s::vector LIMIT 1
-                """, (vec_str, vec_str))
-                row = cur.fetchone()
-                if row and row[2] > 0.95:
-                    old_id, old_text, sim = row
+
+                # Near-duplicate check (cosine similarity > 0.95)
+                hits = client.search(
+                    collection_name=QDRANT_COLLECTION,
+                    query_vector=embedding,
+                    limit=1,
+                    with_payload=True,
+                )
+                if hits and hits[0].score > 0.95:
+                    old_id   = hits[0].id
+                    old_text = hits[0].payload.get("content", "")
                     if len(chunk) > len(old_text):
-                        cur.execute(
-                            "UPDATE knowledge SET content=%s, embedding=%s::vector, timestamp=%s, length=%s WHERE id=%s",
-                            (chunk, vec_str, datetime.now().isoformat(), len(chunk), old_id)
+                        # Update in place — Qdrant upsert replaces by ID
+                        client.upsert(
+                            collection_name=QDRANT_COLLECTION,
+                            points=[PointStruct(
+                                id=old_id,
+                                vector=embedding,
+                                payload={"content": chunk, "timestamp": datetime.now().isoformat(), "length": len(chunk)}
+                            )]
                         )
                         updated_count += 1
-                        print(f"  🔄 Chunk {idx+1}: Updated (sim:{sim:.3f})")
+                        print(f"  🔄 Chunk {idx+1}: Updated (score:{hits[0].score:.3f})")
                     else:
                         skipped_count += 1
-                        print(f"  ⏭️  Chunk {idx+1}: Skipped (sim:{sim:.3f})")
+                        print(f"  ⏭️  Chunk {idx+1}: Skipped (score:{hits[0].score:.3f})")
                 else:
-                    cur.execute(
-                        "INSERT INTO knowledge (id,content,embedding,timestamp,length) VALUES (%s,%s,%s::vector,%s,%s)",
-                        (str(uuid.uuid4()), chunk, vec_str, datetime.now().isoformat(), len(chunk))
+                    client.upsert(
+                        collection_name=QDRANT_COLLECTION,
+                        points=[PointStruct(
+                            id=str(uuid.uuid4()),
+                            vector=embedding,
+                            payload={"content": chunk, "timestamp": datetime.now().isoformat(), "length": len(chunk)}
+                        )]
                     )
                     new_count += 1
                     print(f"  ✅ Chunk {idx+1}: Stored")
             except Exception as e:
                 print(f"  ❌ Chunk {idx+1}: {e}"); continue
-        conn.commit()
-        cur.execute("SELECT COUNT(*) FROM knowledge"); total = cur.fetchone()[0]
-        cur.close(); conn.close()
+
+        total = client.get_collection(QDRANT_COLLECTION).points_count
     except Exception as e:
-        return {"error": f"Database error: {str(e)}", "success": False}
+        return {"error": f"Qdrant error: {str(e)}", "success": False}
 
     return {
         "success": True,
@@ -401,29 +399,29 @@ async def ask(data: AskRequest):
     print(f"\n❓ Question: {question}")
 
     try:
-        # ── Step 1: Personal knowledge (pgvector) ────────────────────────────
+        # ── Step 1: Personal knowledge (Qdrant) ─────────────────────────────
         q_embed = get_embedding(question, input_type="search_query")
-        vec_str = "[" + ",".join(str(x) for x in q_embed) + "]"
-        conn = _pg(); cur = conn.cursor()
-        cur.execute("""
-            SELECT id, content, 1-(embedding <=> %s::vector) AS similarity
-            FROM knowledge ORDER BY embedding <=> %s::vector LIMIT %s
-        """, (vec_str, vec_str, data.top_k))
-        rows = cur.fetchall(); cur.close(); conn.close()
+        client  = _qdrant()
+        hits    = client.search(
+            collection_name=QDRANT_COLLECTION,
+            query_vector=q_embed,
+            limit=data.top_k,
+            with_payload=True,
+        )
 
-        best_score   = rows[0][2] if rows else 0
-        has_personal = bool(rows) and best_score > 0.25
-        print(f"🔍 Personal: {len(rows)} matches, best:{best_score:.3f}, relevant:{has_personal}")
+        best_score   = hits[0].score if hits else 0
+        has_personal = bool(hits) and best_score > 0.25
+        print(f"🔍 Personal: {len(hits)} matches, best:{best_score:.3f}, relevant:{has_personal}")
 
         # ── Step 2: Live web search if needed ────────────────────────────────
-        needs_web  = _needs_web_search(question)
+        needs_web   = _needs_web_search(question)
         web_context = await web_search(question) if needs_web else ""
 
         # ── Step 3: Build prompt + call Cohere ───────────────────────────────
         if has_personal:
             personal_context = "\n\n".join(
-                f"[Personal Knowledge {i+1}, relevance:{r[2]:.2f}]\n{r[1]}"
-                for i, r in enumerate(rows) if r[2] > 0.2
+                f"[Personal Knowledge {i+1}, relevance:{h.score:.2f}]\n{h.payload.get('content','')}"
+                for i, h in enumerate(hits) if h.score > 0.2
             )
             web_section = f"\n\nLive Web Search Results:\n{web_context}" if web_context else ""
             prompt = f"""You are a helpful personal AI assistant. Answer using all available context.
@@ -471,7 +469,7 @@ Answer:"""
             "answer"       : answer_text,
             "source"       : source,
             "confidence"   : best_score,
-            "matches_found": len(rows),
+            "matches_found": len(hits),
             "web_searched" : bool(web_context),
             "success"      : True,
             "note"         : note,
@@ -487,28 +485,32 @@ Answer:"""
 @app.post("/forget")
 async def forget(data: ForgetRequest):
     try:
-        conn = _pg(); cur = conn.cursor()
+        client = _qdrant()
         if data.forget_all:
-            cur.execute("DELETE FROM knowledge")
-            conn.commit(); cur.close(); conn.close()
+            # Delete and recreate the collection
+            client.delete_collection(QDRANT_COLLECTION)
+            client.create_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config=VectorParams(size=1024, distance=Distance.COSINE),
+            )
             return {"success": True, "message": "All knowledge has been forgotten", "items_deleted": "all"}
         elif data.query:
             q_embed = get_embedding(data.query, input_type="search_query")
-            vec_str = "[" + ",".join(str(x) for x in q_embed) + "]"
-            cur.execute("""
-                SELECT id, 1-(embedding <=> %s::vector) AS sim
-                FROM knowledge ORDER BY embedding <=> %s::vector LIMIT 10
-            """, (vec_str, vec_str))
-            rows = cur.fetchall()
-            ids_to_delete = [r[0] for r in rows if r[1] > 0.7]
+            hits    = client.search(
+                collection_name=QDRANT_COLLECTION,
+                query_vector=q_embed,
+                limit=10,
+                with_payload=False,
+            )
+            ids_to_delete = [h.id for h in hits if h.score > 0.7]
             if ids_to_delete:
-                cur.execute("DELETE FROM knowledge WHERE id = ANY(%s)", (ids_to_delete,))
-                conn.commit(); cur.close(); conn.close()
+                client.delete(
+                    collection_name=QDRANT_COLLECTION,
+                    points_selector=ids_to_delete,
+                )
                 return {"success": True, "message": f"Forgot {len(ids_to_delete)} related knowledge items", "items_deleted": len(ids_to_delete)}
-            cur.close(); conn.close()
             return {"success": True, "message": "No highly relevant items found to forget", "items_deleted": 0}
         else:
-            cur.close(); conn.close()
             return {"error": "Please specify either 'query' to forget specific content or 'forget_all': true", "success": False}
     except Exception as e:
         print(f"❌ Error during forget: {e}")
@@ -520,12 +522,12 @@ async def forget(data: ForgetRequest):
 @app.get("/stats")
 async def get_stats():
     try:
-        conn = _pg(); cur = conn.cursor()
-        cur.execute("SELECT COUNT(*), COALESCE(SUM(length),0) FROM knowledge")
-        count, total_chars = cur.fetchone()
-        cur.close(); conn.close()
-        return {"success": True, "total_knowledge_items": count,
-                "total_chars": total_chars, "storage": "PostgreSQL + pgvector", "status": "ready"}
+        client = _qdrant()
+        info   = client.get_collection(QDRANT_COLLECTION)
+        return {"success": True,
+                "total_knowledge_items": info.points_count,
+                "storage": "Qdrant Cloud",
+                "status" : "ready"}
     except Exception as e:
         return {"error": str(e), "success": False}
 
@@ -535,10 +537,18 @@ async def get_stats():
 @app.get("/list")
 async def list_knowledge():
     try:
-        conn = _pg(); cur = conn.cursor()
-        cur.execute("SELECT content, length, timestamp FROM knowledge ORDER BY timestamp DESC LIMIT 10")
-        rows = cur.fetchall(); cur.close(); conn.close()
-        items = [{"preview": r[0][:100]+"...", "length": r[1], "timestamp": r[2] or "unknown"} for r in rows]
+        client  = _qdrant()
+        results, _ = client.scroll(
+            collection_name=QDRANT_COLLECTION,
+            limit=10,
+            with_payload=True,
+            with_vectors=False,
+        )
+        items = [{
+            "preview"  : r.payload.get("content", "")[:100] + "...",
+            "length"   : r.payload.get("length", 0),
+            "timestamp": r.payload.get("timestamp", "unknown"),
+        } for r in results]
         return {"success": True, "sample_count": len(items), "items": items,
                 "note": "This is a sample of learned content, not complete list"}
     except Exception as e:
