@@ -21,7 +21,7 @@ COHERE_API_KEY  = os.getenv("COHERE_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
 # DynamoDB — set these on Render dashboard (Environment tab)
-AWS_REGION   = os.getenv("AWS_REGION",   "ap-south-1")
+AWS_REGION   = os.getenv("AWS_REGION",   "us-east-1")
 DYNAMO_TABLE = os.getenv("DYNAMO_TABLE", "personal_ai_chat")
 USER_ID      = os.getenv("USER_ID",      "rahul_personal_ai")
 
