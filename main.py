@@ -400,14 +400,21 @@ async def ask(data: AskRequest):
 
     try:
         # ── Step 1: Personal knowledge (Qdrant) ─────────────────────────────
+        # Guard: searching an empty collection throws an exception in Qdrant
         q_embed = get_embedding(question, input_type="search_query")
-        client  = _qdrant()
-        hits    = client.search(
-            collection_name=QDRANT_COLLECTION,
-            query_vector=q_embed,
-            limit=data.top_k,
-            with_payload=True,
-        )
+        hits = []
+        try:
+            client = _qdrant()
+            info   = client.get_collection(QDRANT_COLLECTION)
+            if info.points_count and info.points_count > 0:
+                hits = client.search(
+                    collection_name=QDRANT_COLLECTION,
+                    query_vector=q_embed,
+                    limit=data.top_k,
+                    with_payload=True,
+                )
+        except Exception as qe:
+            print(f"⚠️ Qdrant search skipped: {qe}")
 
         best_score   = hits[0].score if hits else 0
         has_personal = bool(hits) and best_score > 0.25
