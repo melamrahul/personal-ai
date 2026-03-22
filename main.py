@@ -336,12 +336,13 @@ async def learn(data: LearnRequest):
                 embedding = get_embedding(chunk, input_type="search_document")
 
                 # Near-duplicate check (cosine similarity > 0.95)
-                hits = client.search(
+                result = client.query_points(
                     collection_name=QDRANT_COLLECTION,
-                    query_vector=embedding,
+                    query=embedding,
                     limit=1,
                     with_payload=True,
                 )
+                hits = result.points
                 if hits and hits[0].score > 0.95:
                     old_id   = hits[0].id
                     old_text = hits[0].payload.get("content", "")
@@ -407,12 +408,13 @@ async def ask(data: AskRequest):
             client = _qdrant()
             info   = client.get_collection(QDRANT_COLLECTION)
             if info.points_count and info.points_count > 0:
-                hits = client.search(
+                result = client.query_points(
                     collection_name=QDRANT_COLLECTION,
-                    query_vector=q_embed,
+                    query=q_embed,
                     limit=data.top_k,
                     with_payload=True,
                 )
+                hits = result.points
         except Exception as qe:
             print(f"⚠️ Qdrant search skipped: {qe}")
 
@@ -503,12 +505,13 @@ async def forget(data: ForgetRequest):
             return {"success": True, "message": "All knowledge has been forgotten", "items_deleted": "all"}
         elif data.query:
             q_embed = get_embedding(data.query, input_type="search_query")
-            hits    = client.search(
+            result  = client.query_points(
                 collection_name=QDRANT_COLLECTION,
-                query_vector=q_embed,
+                query=q_embed,
                 limit=10,
                 with_payload=False,
             )
+            hits = result.points
             ids_to_delete = [h.id for h in hits if h.score > 0.7]
             if ids_to_delete:
                 client.delete(
