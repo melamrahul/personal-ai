@@ -74,9 +74,12 @@ def _table():
         _dynamo_resource = boto3.resource("dynamodb", region_name=AWS_REGION)
     return _dynamo_resource.Table(DYNAMO_TABLE)
 
-def _conv_key(conv_id):               return f"CONV#{conv_id}"
-def _msg_key(conv_id, ts, mid):       return f"MSG#{conv_id}#{ts:020d}#{mid}"
-def _msg_prefix(conv_id):             return f"MSG#{conv_id}#"
+# ── DynamoDB key builders (matches your actual table: PK=pk, SK=sk) ─────────
+USER_PK = f"USER#{USER_ID}"          # partition key value — always the same
+
+def _conv_key(conv_id):         return f"CONV#{conv_id}"
+def _msg_key(conv_id, ts, mid): return f"MSG#{conv_id}#{ts:020d}#{mid}"
+def _msg_prefix(conv_id):       return f"MSG#{conv_id}#"
 
 # -------------------------------
 # 3️⃣ FastAPI setup
@@ -564,27 +567,14 @@ async def root():
     return html
 
 # -------------------------------
-# ✅ Health check
-# -------------------------------
-@app.api_route("/health", methods=["GET", "HEAD"])
-async def health():
-    return {"ok": True}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
+# ✅ Healt# ══════════════════════════════════════════════════════════════════════════════
 # 🗄️  DYNAMODB CHAT SYNC ENDPOINTS
 #
-# These replace Firebase Firestore for storing conversations + messages.
-# Android app and web app call these instead of talking to Firebase.
-#
-# Table: personal_ai_chat
-#   PK  userId  = "rahul_personal_ai"
-#   SK  itemKey = "CONV#<id>"  |  "MSG#<conv_id>#<ts_padded>#<msg_id>"
-#   GSI gsi1    : gsi1pk=userId, gsi1sk=updatedAt(Number) for conv ordering
-#
-# Add to requirements.txt:  boto3>=1.34.0
-# Set on Render:  AWS_ACCESS_KEY_ID  AWS_SECRET_ACCESS_KEY  AWS_REGION
-#                 DYNAMO_TABLE  USER_ID
+# Table schema (your actual table — confirmed from ValidationException errors):
+#   PK   : pk      (String)  = "USER#rahul_personal_ai"
+#   SK   : sk      (String)  = "CONV#<id>"  |  "MSG#<conv_id>#<ts_padded>#<msg_id>"
+#   GSI  : gsi1pk  (String)  = "USER#rahul_personal_ai"
+#          gsi1sk  (Number)  = updatedAt timestamp — used for conv ordering
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/convs")
@@ -593,12 +583,12 @@ async def list_convs():
     try:
         resp  = _table().query(
             IndexName              = "gsi1",
-            KeyConditionExpression = Key("userId").eq(USER_ID),
-            ScanIndexForward       = False,
+            KeyConditionExpression = Key("gsi1pk").eq(USER_PK),
+            ScanIndexForward       = False,   # DESC — newest first
         )
         convs = []
         for item in resp.get("Items", []):
-            if str(item.get("itemKey", "")).startswith("CONV#"):
+            if str(item.get("sk", "")).startswith("CONV#"):
                 convs.append({
                     "id"       : item["convId"],
                     "title"    : item.get("title",     "Chat"),
@@ -614,7 +604,9 @@ async def list_convs():
 async def get_conv(conv_id: str):
     """Get a single conversation by ID (used by the share page)."""
     try:
-        resp = _table().get_item(Key={"userId": USER_ID, "itemKey": _conv_key(conv_id)})
+        resp = _table().get_item(
+            Key={"pk": USER_PK, "sk": _conv_key(conv_id)}
+        )
         item = resp.get("Item")
         if not item:
             raise HTTPException(status_code=404, detail="Conversation not found")
@@ -634,24 +626,22 @@ async def get_conv(conv_id: str):
 @app.post("/conv")
 async def upsert_conv(body: ConvIn):
     """Create or update a conversation.
-    If title is blank (touch-only call from touchConversation), only refresh
-    the GSI sort key so sidebar ordering stays current without overwriting the real title."""
+    If title is blank (touch-only call), only refresh the GSI sort key."""
     try:
         if body.title:
-            # Full create/update — write all fields
             _table().put_item(Item={
-                "userId"    : USER_ID,
-                "itemKey"   : _conv_key(body.id),
-                "gsi1pk"    : USER_ID,
+                "pk"        : USER_PK,
+                "sk"        : _conv_key(body.id),
+                "gsi1pk"    : USER_PK,
                 "gsi1sk"    : body.updatedAt,
                 "convId"    : body.id,
                 "title"     : body.title,
                 "createdAt" : body.createdAt,
             })
         else:
-            # Touch only — just update the updatedAt sort key
+            # Touch only — update sort key without overwriting title
             _table().update_item(
-                Key={"userId": USER_ID, "itemKey": _conv_key(body.id)},
+                Key={"pk": USER_PK, "sk": _conv_key(body.id)},
                 UpdateExpression="SET gsi1sk = :ts",
                 ExpressionAttributeValues={":ts": body.updatedAt}
             )
@@ -666,14 +656,14 @@ async def delete_conv(conv_id: str):
     try:
         resp = _table().query(
             KeyConditionExpression=(
-                Key("userId").eq(USER_ID) &
-                Key("itemKey").begins_with(_msg_prefix(conv_id))
+                Key("pk").eq(USER_PK) &
+                Key("sk").begins_with(_msg_prefix(conv_id))
             )
         )
         with _table().batch_writer() as batch:
             for item in resp.get("Items", []):
-                batch.delete_item(Key={"userId": item["userId"], "itemKey": item["itemKey"]})
-            batch.delete_item(Key={"userId": USER_ID, "itemKey": _conv_key(conv_id)})
+                batch.delete_item(Key={"pk": item["pk"], "sk": item["sk"]})
+            batch.delete_item(Key={"pk": USER_PK, "sk": _conv_key(conv_id)})
         return {"success": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -683,16 +673,15 @@ async def delete_conv(conv_id: str):
 async def list_msgs(conv_id: str, since: Optional[int] = None):
     """
     List messages for a conversation, oldest-first.
-    ?since=<timestamp_ms> returns only messages newer than that time
-    — used for efficient 1-second polling so only new data is fetched.
+    ?since=<timestamp_ms> returns only messages newer than that time.
     """
     try:
         resp  = _table().query(
             KeyConditionExpression=(
-                Key("userId").eq(USER_ID) &
-                Key("itemKey").begins_with(_msg_prefix(conv_id))
+                Key("pk").eq(USER_PK) &
+                Key("sk").begins_with(_msg_prefix(conv_id))
             ),
-            ScanIndexForward=True
+            ScanIndexForward=True   # ASC — oldest first
         )
         items = resp.get("Items", [])
         if since:
@@ -723,8 +712,8 @@ async def upsert_msg(body: MsgIn):
     """Create or update a message, and refresh the conversation updatedAt."""
     try:
         _table().put_item(Item={
-            "userId"         : USER_ID,
-            "itemKey"        : _msg_key(body.conversationId, body.timestamp, body.id),
+            "pk"             : USER_PK,
+            "sk"             : _msg_key(body.conversationId, body.timestamp, body.id),
             "msgId"          : body.id,
             "convId"         : body.conversationId,
             "role"           : body.role,
@@ -737,9 +726,10 @@ async def upsert_msg(body: MsgIn):
             "editTotal"      : body.editTotal,
             "activeEditIndex": body.activeEditIndex,
         })
+        # Touch conversation so sidebar ordering stays current
         now = int(time.time() * 1000)
         _table().update_item(
-            Key={"userId": USER_ID, "itemKey": _conv_key(body.conversationId)},
+            Key={"pk": USER_PK, "sk": _conv_key(body.conversationId)},
             UpdateExpression="SET gsi1sk = :ts",
             ExpressionAttributeValues={":ts": now}
         )
@@ -754,13 +744,13 @@ async def delete_msg(conv_id: str, msg_id: str):
     try:
         resp = _table().query(
             KeyConditionExpression=(
-                Key("userId").eq(USER_ID) &
-                Key("itemKey").begins_with(_msg_prefix(conv_id))
+                Key("pk").eq(USER_PK) &
+                Key("sk").begins_with(_msg_prefix(conv_id))
             )
         )
         for item in resp.get("Items", []):
             if item.get("msgId") == msg_id:
-                _table().delete_item(Key={"userId": item["userId"], "itemKey": item["itemKey"]})
+                _table().delete_item(Key={"pk": item["pk"], "sk": item["sk"]})
                 return {"success": True}
         return {"success": False, "error": "Message not found"}
     except Exception as e:
