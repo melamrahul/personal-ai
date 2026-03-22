@@ -3,13 +3,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List
-import os, traceback, uuid, time
+import os, traceback, uuid, time, re
 from datetime import datetime
 from dotenv import load_dotenv
 import cohere
-from pinecone import Pinecone, ServerlessSpec
+import psycopg2
+import psycopg2.extras
+import httpx
+import urllib.parse
 
-# ── DynamoDB (added for chat sync) ───────────────────────────────────────────
+# ── DynamoDB (chat sync) ──────────────────────────────────────────────────────
 import boto3
 from boto3.dynamodb.conditions import Key
 
@@ -17,53 +20,63 @@ from boto3.dynamodb.conditions import Key
 # 1️⃣ Load environment variables
 # -------------------------------
 load_dotenv()
-COHERE_API_KEY  = os.getenv("COHERE_API_KEY")
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+
+# PostgreSQL / pgvector — set these 5 vars on Render dashboard
+PG_HOST     = os.getenv("PG_HOST",     "localhost")
+PG_PORT     = os.getenv("PG_PORT",     "5432")
+PG_DB       = os.getenv("PG_DB",       "personalai")
+PG_USER     = os.getenv("PG_USER",     "postgres")
+PG_PASSWORD = os.getenv("PG_PASSWORD", "")
 
 # DynamoDB — set these on Render dashboard (Environment tab)
 AWS_REGION   = os.getenv("AWS_REGION",   "us-east-1")
 DYNAMO_TABLE = os.getenv("DYNAMO_TABLE", "personal_ai_chat")
 USER_ID      = os.getenv("USER_ID",      "rahul_personal_ai")
 
-if not COHERE_API_KEY or not PINECONE_API_KEY:
-    raise ValueError("❌ Missing API keys! Check .env file")
+# Web search — free public APIs, no key needed
+WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() == "true"
+
+if not COHERE_API_KEY:
+    raise ValueError("❌ Missing COHERE_API_KEY! Check .env file")
 
 co = cohere.Client(COHERE_API_KEY)
 
 # -------------------------------
-# 2️⃣ Initialize Pinecone
+# 2️⃣ Initialize PostgreSQL / pgvector
 # -------------------------------
-pc = Pinecone(api_key=PINECONE_API_KEY)
-index_name = "personal-ai"
-expected_dim = 1024
-
-existing_indexes = {i.name: i for i in pc.list_indexes()}
-
-if index_name in existing_indexes:
-    info = pc.describe_index(index_name)
-    if info.dimension != expected_dim:
-        print(f"⚠️ Recreating index due to dimension mismatch")
-        pc.delete_index(index_name)
-        time.sleep(1)
-        pc.create_index(
-            name=index_name,
-            dimension=expected_dim,
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
-        )
-        print("✅ Index recreated")
-else:
-    print(f"ℹ️ Creating new index '{index_name}'")
-    pc.create_index(
-        name=index_name,
-        dimension=expected_dim,
-        metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+def _pg():
+    """Return a fresh PostgreSQL connection."""
+    return psycopg2.connect(
+        host=PG_HOST, port=int(PG_PORT), dbname=PG_DB,
+        user=PG_USER, password=PG_PASSWORD, connect_timeout=10,
     )
-    print("✅ Index created")
 
-index = pc.Index(index_name)
-time.sleep(1)
+def _init_pg():
+    """Create the knowledge table + ivfflat vector index on first startup."""
+    try:
+        conn = _pg(); cur = conn.cursor()
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS knowledge (
+                id        TEXT PRIMARY KEY,
+                content   TEXT NOT NULL,
+                embedding vector(1024) NOT NULL,
+                timestamp TEXT,
+                length    INTEGER
+            );
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS knowledge_vec_idx
+            ON knowledge USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 100);
+        """)
+        conn.commit(); cur.close(); conn.close()
+        print("✅ pgvector table ready")
+    except Exception as e:
+        print(f"⚠️ pgvector init: {e}")
+
+_init_pg()
 
 # ── DynamoDB lazy init ────────────────────────────────────────────────────────
 _dynamo_resource = None
@@ -74,8 +87,7 @@ def _table():
         _dynamo_resource = boto3.resource("dynamodb", region_name=AWS_REGION)
     return _dynamo_resource.Table(DYNAMO_TABLE)
 
-# ── DynamoDB key builders (matches your actual table: PK=pk, SK=sk) ─────────
-USER_PK = f"USER#{USER_ID}"          # partition key value — always the same
+USER_PK = f"USER#{USER_ID}"
 
 def _conv_key(conv_id):         return f"CONV#{conv_id}"
 def _msg_key(conv_id, ts, mid): return f"MSG#{conv_id}#{ts:020d}#{mid}"
@@ -105,7 +117,7 @@ async def catch_exceptions_middleware(request: Request, call_next):
         print(f"\n⚠️ ERROR at {request.url.path}:")
         traceback.print_exc()
         return JSONResponse(
-            status_code=500, 
+            status_code=500,
             content={"error": str(e), "detail": traceback.format_exc()}
         )
 
@@ -147,6 +159,138 @@ class MsgIn(BaseModel):
     editIndex       : int           = 0
     editTotal       : int           = 1
     activeEditIndex : int           = 0
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🌐  WEB SEARCH HELPERS  (DuckDuckGo + Wikipedia — no API key needed)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _ddg_search(query: str, max_results: int = 5) -> List[dict]:
+    """DuckDuckGo Instant Answer API — free, no key, no sign-up."""
+    results = []
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; PersonalAI/1.0)"}
+    try:
+        params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get("https://api.duckduckgo.com/", params=params, headers=headers)
+            d = r.json()
+        if d.get("AbstractText"):
+            results.append({
+                "title"  : d.get("Heading", query),
+                "snippet": d["AbstractText"][:500],
+                "url"    : d.get("AbstractURL", ""),
+                "source" : "DuckDuckGo/Wikipedia"
+            })
+        for topic in d.get("RelatedTopics", [])[:3]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                results.append({
+                    "title"  : topic.get("Text", "")[:80],
+                    "snippet": topic.get("Text", "")[:300],
+                    "url"    : topic.get("FirstURL", ""),
+                    "source" : "DuckDuckGo"
+                })
+        for row in d.get("Infobox", {}).get("content", [])[:3]:
+            if row.get("value"):
+                results.append({
+                    "title"  : row.get("label", ""),
+                    "snippet": f"{row.get('label','')}: {row.get('value','')}",
+                    "url"    : d.get("AbstractURL", ""),
+                    "source" : "DuckDuckGo Infobox"
+                })
+    except Exception as e:
+        print(f"⚠️ DDG search failed: {e}")
+    return results[:max_results]
+
+
+async def _wikipedia_search(query: str, sentences: int = 4) -> dict | None:
+    """Wikipedia REST API — free, reliable for factual topics."""
+    try:
+        base = "https://en.wikipedia.org/w/api.php"
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(base, params={
+                "action": "query", "list": "search", "srsearch": query,
+                "srlimit": 1, "format": "json", "utf8": 1
+            })
+            hits = r.json().get("query", {}).get("search", [])
+        if not hits:
+            return None
+        title = hits[0]["title"]
+        async with httpx.AsyncClient(timeout=8) as client:
+            r2 = await client.get(base, params={
+                "action": "query", "prop": "extracts", "exintro": True,
+                "exsentences": sentences, "explaintext": True,
+                "titles": title, "format": "json", "utf8": 1
+            })
+            pages = r2.json().get("query", {}).get("pages", {})
+        page = next(iter(pages.values()))
+        extract = page.get("extract", "").strip()
+        if not extract:
+            return None
+        return {
+            "title"  : title,
+            "snippet": extract[:600],
+            "url"    : f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}",
+            "source" : "Wikipedia"
+        }
+    except Exception as e:
+        print(f"⚠️ Wikipedia search failed: {e}")
+        return None
+
+
+async def web_search(query: str, include_wiki: bool = True) -> str:
+    """
+    Run DDG + Wikipedia concurrently, return a formatted context string.
+    Returns empty string on failure so the LLM still answers from training.
+    """
+    if not WEB_SEARCH_ENABLED:
+        return ""
+    print(f"🌐 Web search: {query!r}")
+    import asyncio
+    tasks = [_ddg_search(query, max_results=4)]
+    if include_wiki:
+        tasks.append(_wikipedia_search(query, sentences=5))
+    results_list = await asyncio.gather(*tasks, return_exceptions=True)
+    ddg_results = results_list[0] if not isinstance(results_list[0], Exception) else []
+    wiki_result = (results_list[1]
+                   if len(results_list) > 1 and not isinstance(results_list[1], Exception)
+                   else None)
+    all_results = []
+    if wiki_result:
+        all_results.append(wiki_result)
+    for r in ddg_results:
+        if wiki_result and r["snippet"][:80] in wiki_result["snippet"]:
+            continue
+        all_results.append(r)
+    if not all_results:
+        print("⚠️ No web results found")
+        return ""
+    lines = ["[Web Search Results]"]
+    for i, r in enumerate(all_results[:5], 1):
+        lines.append(f"\n[{i}] {r['title']} ({r['source']})")
+        lines.append(f"    {r['snippet']}")
+        if r.get("url"):
+            lines.append(f"    URL: {r['url']}")
+    print(f"✅ Web search: {len(all_results)} results")
+    return "\n".join(lines)
+
+
+def _needs_web_search(question: str) -> bool:
+    """Return True if the question likely needs live/current data."""
+    q = question.lower()
+    triggers = [
+        "today", "right now", "currently", "latest", "recent", "news",
+        "price", "stock", "weather", "score", "result", "winner",
+        "who is the", "who won", "what happened", "2024", "2025", "2026",
+        "pm of", "cm of", "president of", "ceo of", "prime minister",
+        "chief minister", "governor", "minister", "election",
+        "how much does", "how much is", "what is the current",
+        "live", "update", "just", "this week", "this month", "this year",
+        "trending", "new", "released", "launched", "announced"
+    ]
+    if any(t in q for t in triggers):
+        return True
+    if re.match(r"^(who|what|when|where|which|how much|how many)\s", q):
+        return True
+    return False
 
 # -------------------------------
 # 6️⃣ Helper functions
@@ -195,58 +339,46 @@ async def learn(data: LearnRequest):
         return {"error": "Text too short - provide at least 10 characters", "success": False}
 
     chunks = chunk_text(text, chunk_size=data.chunk_size)
-    vectors = []
     new_count = updated_count = skipped_count = 0
     print(f"\n📚 Learning {len(chunks)} chunks...")
 
-    for idx, chunk in enumerate(chunks):
-        try:
-            embedding = get_embedding(chunk, input_type="search_document")
-            should_skip = False
-            try:
-                similar_results = index.query(vector=embedding, top_k=1, include_metadata=True)
-                matches = getattr(similar_results, "matches", []) or similar_results.get("matches", [])
-                if matches:
-                    best_match = matches[0]
-                    similarity = best_match.get("score", 0) if isinstance(best_match, dict) else getattr(best_match, "score", 0)
-                    if similarity > 0.95:
-                        old_id   = best_match.get("id") if isinstance(best_match, dict) else getattr(best_match, "id")
-                        old_text = (best_match.get("metadata", {}) if isinstance(best_match, dict) else getattr(best_match, "metadata", {})).get("text", "")
-                        if len(chunk) > len(old_text):
-                            index.delete(ids=[old_id])
-                            updated_count += 1
-                            print(f"  🔄 Chunk {idx+1}: Updated (similarity: {similarity:.3f})")
-                        else:
-                            skipped_count += 1
-                            should_skip = True
-                            print(f"  ⏭️  Chunk {idx+1}: Skipped (already exists, similarity: {similarity:.3f})")
-            except Exception as e:
-                print(f"  ⚠️ Similarity check failed for chunk {idx+1}: {e}")
-
-            if not should_skip:
-                vectors.append({
-                    "id": str(uuid.uuid4()),
-                    "values": embedding,
-                    "metadata": {"text": chunk, "timestamp": datetime.now().isoformat(), "length": len(chunk)}
-                })
-                new_count += 1
-                print(f"  ✅ Chunk {idx+1}: Stored")
-        except Exception as e:
-            print(f"  ❌ Error processing chunk {idx+1}: {e}")
-            continue
-
-    if vectors:
-        try:
-            index.upsert(vectors=vectors)
-            print(f"✅ Successfully stored {len(vectors)} vectors")
-        except Exception as e:
-            return {"error": f"Failed to store vectors: {str(e)}", "success": False}
-
     try:
-        stats = index.describe_index_stats()
-        total_vectors = stats.total_vector_count if hasattr(stats, "total_vector_count") else stats.get("total_vector_count", 0)
-    except:
-        total_vectors = "unknown"
+        conn = _pg(); cur = conn.cursor()
+        for idx, chunk in enumerate(chunks):
+            try:
+                embedding = get_embedding(chunk, input_type="search_document")
+                vec_str   = "[" + ",".join(str(x) for x in embedding) + "]"
+                cur.execute("""
+                    SELECT id, content, 1-(embedding <=> %s::vector) AS sim
+                    FROM knowledge ORDER BY embedding <=> %s::vector LIMIT 1
+                """, (vec_str, vec_str))
+                row = cur.fetchone()
+                if row and row[2] > 0.95:
+                    old_id, old_text, sim = row
+                    if len(chunk) > len(old_text):
+                        cur.execute(
+                            "UPDATE knowledge SET content=%s, embedding=%s::vector, timestamp=%s, length=%s WHERE id=%s",
+                            (chunk, vec_str, datetime.now().isoformat(), len(chunk), old_id)
+                        )
+                        updated_count += 1
+                        print(f"  🔄 Chunk {idx+1}: Updated (sim:{sim:.3f})")
+                    else:
+                        skipped_count += 1
+                        print(f"  ⏭️  Chunk {idx+1}: Skipped (sim:{sim:.3f})")
+                else:
+                    cur.execute(
+                        "INSERT INTO knowledge (id,content,embedding,timestamp,length) VALUES (%s,%s,%s::vector,%s,%s)",
+                        (str(uuid.uuid4()), chunk, vec_str, datetime.now().isoformat(), len(chunk))
+                    )
+                    new_count += 1
+                    print(f"  ✅ Chunk {idx+1}: Stored")
+            except Exception as e:
+                print(f"  ❌ Chunk {idx+1}: {e}"); continue
+        conn.commit()
+        cur.execute("SELECT COUNT(*) FROM knowledge"); total = cur.fetchone()[0]
+        cur.close(); conn.close()
+    except Exception as e:
+        return {"error": f"Database error: {str(e)}", "success": False}
 
     return {
         "success": True,
@@ -254,119 +386,99 @@ async def learn(data: LearnRequest):
         "chunks_stored": new_count,
         "chunks_updated": updated_count,
         "chunks_skipped": skipped_count,
-        "total_knowledge_items": total_vectors,
+        "total_knowledge_items": total,
         "message": f"Learned successfully! {new_count} new, {updated_count} updated, {skipped_count} skipped (duplicates)"
     }
 
 # -------------------------------
-# 8️⃣ Ask endpoint - HYBRID
+# 8️⃣ Ask endpoint - HYBRID + WEB SEARCH
 # -------------------------------
 @app.post("/ask")
 async def ask(data: AskRequest):
     question = data.text.strip()
     if not question:
         return {"error": "No question provided", "success": False}
-
     print(f"\n❓ Question: {question}")
 
     try:
+        # ── Step 1: Personal knowledge (pgvector) ────────────────────────────
         q_embed = get_embedding(question, input_type="search_query")
-        results = index.query(vector=q_embed, top_k=data.top_k, include_metadata=True)
-        matches = getattr(results, "matches", []) or results.get("matches", [])
+        vec_str = "[" + ",".join(str(x) for x in q_embed) + "]"
+        conn = _pg(); cur = conn.cursor()
+        cur.execute("""
+            SELECT id, content, 1-(embedding <=> %s::vector) AS similarity
+            FROM knowledge ORDER BY embedding <=> %s::vector LIMIT %s
+        """, (vec_str, vec_str, data.top_k))
+        rows = cur.fetchall(); cur.close(); conn.close()
 
-        has_personal_knowledge = False
-        best_score = 0
-        if matches:
-            best_score = matches[0].get("score", 0) if isinstance(matches[0], dict) else getattr(matches[0], "score", 0)
-            has_personal_knowledge = best_score > 0.25
+        best_score   = rows[0][2] if rows else 0
+        has_personal = bool(rows) and best_score > 0.25
+        print(f"🔍 Personal: {len(rows)} matches, best:{best_score:.3f}, relevant:{has_personal}")
 
-        print(f"🔍 Personal knowledge check: {len(matches)} matches, best score: {best_score:.3f}, relevant: {has_personal_knowledge}")
+        # ── Step 2: Live web search if needed ────────────────────────────────
+        needs_web  = _needs_web_search(question)
+        web_context = await web_search(question) if needs_web else ""
 
-        if has_personal_knowledge:
-            context_parts = []
-            for i, match in enumerate(matches):
-                score = match.get("score", 0) if isinstance(match, dict) else getattr(match, "score", 0)
-                text  = (match.get("metadata", {}) if isinstance(match, dict) else getattr(match, "metadata", {})).get("text", "")
-                if score > 0.2:
-                    context_parts.append(f"[Personal Knowledge {i+1}, relevance: {score:.2f}]\n{text}")
-
-            context = "\n\n".join(context_parts)
-            needs_current_info = any(k in question.lower() for k in ["current","now","today","latest","recent","2024","2025"])
-
-            prompt = f"""You are a helpful AI assistant. Answer the following question using the personal knowledge provided AND your general knowledge.
+        # ── Step 3: Build prompt + call Cohere ───────────────────────────────
+        if has_personal:
+            personal_context = "\n\n".join(
+                f"[Personal Knowledge {i+1}, relevance:{r[2]:.2f}]\n{r[1]}"
+                for i, r in enumerate(rows) if r[2] > 0.2
+            )
+            web_section = f"\n\nLive Web Search Results:\n{web_context}" if web_context else ""
+            prompt = f"""You are a helpful personal AI assistant. Answer using all available context.
 
 Question: {question}
 
-Personal Knowledge from the user's database:
-{context}
+Personal Knowledge (from user's stored data):
+{personal_context}{web_section}
 
 Instructions:
-- Use the personal knowledge if it's directly relevant to the question
-- Supplement with your general knowledge to provide a complete answer
-- Provide a comprehensive, accurate, and up-to-date answer
+- Prioritise personal knowledge when directly relevant
+- Use web search results for current/factual data
+- Combine both sources for the most complete answer
 - Be conversational and helpful
-- Don't mention knowledge cutoffs or date limitations - just answer directly
 
 Answer:"""
+            source = "personal_knowledge"
+            note   = "Answer based on your learned data" + (" + live web search" if web_context else "")
 
-            chat_response = co.chat(
-                model="command-r-plus-08-2024",
-                message=prompt,
-                temperature=0.5,
-                connectors=[{"id": "web-search"}] if needs_current_info else None
-            )
-            answer_text = getattr(chat_response, "text", str(chat_response)).strip()
-            return {"answer": answer_text, "source": "personal_knowledge", "confidence": best_score, "matches_found": len(matches), "success": True, "note": "Answer based on your learned data"}
+        elif data.use_general_knowledge:
+            web_section = f"\nLive Web Search Results:\n{web_context}\n" if web_context else ""
+            prompt = f"""You are a helpful AI assistant with access to live web data.
+
+Question: {question}
+{web_section}
+Instructions:
+- {"Use the web search results above to give an accurate up-to-date answer" if web_context else "Answer from your training knowledge"}
+- Be conversational and concise
+
+Answer:"""
+            source = "web_search" if web_context else "general_knowledge"
+            note   = "Answer from live web search" if web_context else "Answer from general AI knowledge (not your personal data)"
 
         else:
-            if not data.use_general_knowledge:
-                return {"answer": "I don't have relevant information in my learned knowledge base about this topic. You can enable general knowledge mode or teach me about it using /learn.", "source": "none", "confidence": best_score, "success": True}
+            return {"answer": "I don't have relevant information in my learned knowledge base about this topic. You can enable general knowledge mode or teach me about it using /learn.",
+                    "source": "none", "confidence": best_score, "success": True}
 
-            needs_current_info = any(k in question.lower() for k in [
-                "current","now","today","latest","recent","2024","2025",
-                "who is","what is the","cm of","pm of","president of","ceo of",
-                "minister","governor","chief minister","prime minister"
-            ])
-
-            if needs_current_info:
-                prompt = f"""You are a helpful AI assistant with access to current information. Answer this question with the most up-to-date information available.
-
-Question: {question}
-
-Instructions:
-- Provide the CURRENT, accurate answer as of 2024-2025
-- If this is about a political position (PM, CM, President, etc.), provide who currently holds that position
-- Be confident and direct - don't mention knowledge limitations
-- Keep it concise and accurate
-- If you truly don't know current information, make your best inference based on recent patterns
-
-Answer:"""
-            else:
-                prompt = f"""You are a helpful AI assistant. Answer this question clearly and accurately.
-
-Question: {question}
-
-Instructions:
-- Provide a clear, accurate answer
-- Be conversational and helpful
-- Keep it concise but complete
-- Answer confidently without mentioning limitations
-
-Answer:"""
-
-            try:
-                chat_response = co.chat(model="command-r-plus-08-2024", message=prompt, temperature=0.3,
-                                        connectors=[{"id": "web-search"}] if needs_current_info else None)
-            except Exception as e:
-                print(f"⚠️ Web search failed, trying without: {e}")
-                chat_response = co.chat(model="command-r-plus-08-2024", message=prompt, temperature=0.3)
-
-            answer_text = getattr(chat_response, "text", str(chat_response)).strip()
-            return {"answer": answer_text, "source": "general_knowledge", "confidence": 0, "matches_found": 0, "success": True, "note": "Answer from general AI knowledge (not your personal data)"}
+        chat_response = co.chat(
+            model="command-r-plus-08-2024",
+            message=prompt,
+            temperature=0.4 if web_context else 0.5,
+        )
+        answer_text = getattr(chat_response, "text", str(chat_response)).strip()
+        return {
+            "answer"       : answer_text,
+            "source"       : source,
+            "confidence"   : best_score,
+            "matches_found": len(rows),
+            "web_searched" : bool(web_context),
+            "success"      : True,
+            "note"         : note,
+        }
 
     except Exception as e:
-        print(f"❌ Error during ask: {e}")
-        traceback.print_exc()
+        print(f"❌ Ask error: {e}"); traceback.print_exc()
         return {"error": f"Failed to process question: {str(e)}", "success": False}
 
 # -------------------------------
@@ -375,34 +487,29 @@ Answer:"""
 @app.post("/forget")
 async def forget(data: ForgetRequest):
     try:
+        conn = _pg(); cur = conn.cursor()
         if data.forget_all:
-            print("🗑️  Deleting all knowledge...")
-            pc.delete_index(index_name)
-            time.sleep(2)
-            pc.create_index(name=index_name, dimension=expected_dim, metric="cosine",
-                            spec=ServerlessSpec(cloud="aws", region="us-east-1"))
+            cur.execute("DELETE FROM knowledge")
+            conn.commit(); cur.close(); conn.close()
             return {"success": True, "message": "All knowledge has been forgotten", "items_deleted": "all"}
-
         elif data.query:
             q_embed = get_embedding(data.query, input_type="search_query")
-            results = index.query(vector=q_embed, top_k=10, include_metadata=True)
-            matches = getattr(results, "matches", []) or results.get("matches", [])
-            if not matches:
-                return {"success": True, "message": "No matching knowledge found to forget", "items_deleted": 0}
-            ids_to_delete = []
-            for match in matches:
-                score    = match.get("score", 0) if isinstance(match, dict) else getattr(match, "score", 0)
-                match_id = match.get("id")       if isinstance(match, dict) else getattr(match, "id")
-                if score > 0.7:
-                    ids_to_delete.append(match_id)
+            vec_str = "[" + ",".join(str(x) for x in q_embed) + "]"
+            cur.execute("""
+                SELECT id, 1-(embedding <=> %s::vector) AS sim
+                FROM knowledge ORDER BY embedding <=> %s::vector LIMIT 10
+            """, (vec_str, vec_str))
+            rows = cur.fetchall()
+            ids_to_delete = [r[0] for r in rows if r[1] > 0.7]
             if ids_to_delete:
-                index.delete(ids=ids_to_delete)
+                cur.execute("DELETE FROM knowledge WHERE id = ANY(%s)", (ids_to_delete,))
+                conn.commit(); cur.close(); conn.close()
                 return {"success": True, "message": f"Forgot {len(ids_to_delete)} related knowledge items", "items_deleted": len(ids_to_delete)}
-            else:
-                return {"success": True, "message": "No highly relevant items found to forget", "items_deleted": 0}
+            cur.close(); conn.close()
+            return {"success": True, "message": "No highly relevant items found to forget", "items_deleted": 0}
         else:
+            cur.close(); conn.close()
             return {"error": "Please specify either 'query' to forget specific content or 'forget_all': true", "success": False}
-
     except Exception as e:
         print(f"❌ Error during forget: {e}")
         return {"error": f"Failed to forget: {str(e)}", "success": False}
@@ -413,9 +520,12 @@ async def forget(data: ForgetRequest):
 @app.get("/stats")
 async def get_stats():
     try:
-        stats = index.describe_index_stats()
-        total_vectors = stats.total_vector_count if hasattr(stats, "total_vector_count") else stats.get("total_vector_count", 0)
-        return {"success": True, "total_knowledge_items": total_vectors, "index_name": index_name, "dimension": expected_dim, "status": "ready"}
+        conn = _pg(); cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), COALESCE(SUM(length),0) FROM knowledge")
+        count, total_chars = cur.fetchone()
+        cur.close(); conn.close()
+        return {"success": True, "total_knowledge_items": count,
+                "total_chars": total_chars, "storage": "PostgreSQL + pgvector", "status": "ready"}
     except Exception as e:
         return {"error": str(e), "success": False}
 
@@ -425,14 +535,12 @@ async def get_stats():
 @app.get("/list")
 async def list_knowledge():
     try:
-        sample_embed = get_embedding("knowledge information", input_type="search_query")
-        results = index.query(vector=sample_embed, top_k=10, include_metadata=True)
-        matches = getattr(results, "matches", []) or results.get("matches", [])
-        items = []
-        for match in matches:
-            metadata = match.get("metadata", {}) if isinstance(match, dict) else getattr(match, "metadata", {})
-            items.append({"preview": metadata.get("text", "")[:100] + "...", "length": metadata.get("length", 0), "timestamp": metadata.get("timestamp", "unknown")})
-        return {"success": True, "sample_count": len(items), "items": items, "note": "This is a sample of learned content, not complete list"}
+        conn = _pg(); cur = conn.cursor()
+        cur.execute("SELECT content, length, timestamp FROM knowledge ORDER BY timestamp DESC LIMIT 10")
+        rows = cur.fetchall(); cur.close(); conn.close()
+        items = [{"preview": r[0][:100]+"...", "length": r[1], "timestamp": r[2] or "unknown"} for r in rows]
+        return {"success": True, "sample_count": len(items), "items": items,
+                "note": "This is a sample of learned content, not complete list"}
     except Exception as e:
         return {"error": str(e), "success": False}
 
@@ -467,34 +575,34 @@ async def root():
         </style>
     </head>
     <body>
-        <h1>🧠 RAG Learning System</h1>
+        <h1>&#x1F9E0; RAG Learning System</h1>
         <div class="info-box">
-            <strong>💡 How it works:</strong><br>
-            • <strong>Personal Mode:</strong> I'll answer from what you teach me via /learn<br>
-            • <strong>General Mode:</strong> I'll answer worldly questions using AI knowledge<br>
-            • <strong>Hybrid:</strong> I combine both for the best answers!
+            <strong>&#x1F4A1; How it works:</strong><br>
+            &bull; <strong>Personal Mode:</strong> I'll answer from what you teach me via /learn<br>
+            &bull; <strong>General Mode:</strong> I'll answer worldly questions using AI knowledge<br>
+            &bull; <strong>Hybrid:</strong> I combine both for the best answers!
         </div>
         <div class="section">
-            <h2>📚 Teach Me (Personal Knowledge)</h2>
-            <textarea id="learnText" placeholder="Enter information to teach me...&#10;&#10;Example: 'My favorite color is purple. I work at Acme Corp as a software engineer.'"></textarea>
+            <h2>&#x1F4DA; Teach Me (Personal Knowledge)</h2>
+            <textarea id="learnText" placeholder="Enter information to teach me..."></textarea>
             <button onclick="learn()">Learn</button>
             <div id="learnResponse" class="response" style="display:none;"></div>
         </div>
         <div class="section">
-            <h2>❓ Ask Me Anything</h2>
-            <textarea id="askText" placeholder="Ask me anything...&#10;&#10;Personal: 'What's my favorite color?'&#10;General: 'What is the capital of France?'"></textarea>
+            <h2>&#x2753; Ask Me Anything</h2>
+            <textarea id="askText" placeholder="Ask me anything..."></textarea>
             <button onclick="ask()">Ask</button>
             <div id="askResponse" class="response" style="display:none;"></div>
         </div>
         <div class="section">
-            <h2>🗑️ Forget</h2>
+            <h2>&#x1F5D1;&#xFE0F; Forget</h2>
             <textarea id="forgetText" placeholder="What should I forget? (leave empty to forget everything)"></textarea>
             <button onclick="forgetSpecific()">Forget This</button>
             <button onclick="forgetAll()" style="background: #dc3545;">Forget Everything</button>
             <div id="forgetResponse" class="response" style="display:none;"></div>
         </div>
         <div class="section">
-            <h2>📊 Stats & Management</h2>
+            <h2>&#x1F4CA; Stats &amp; Management</h2>
             <button onclick="getStats()">Get Stats</button>
             <button onclick="listKnowledge()">List Knowledge</button>
             <div id="statsResponse" class="response" style="display:none;"></div>
@@ -520,9 +628,13 @@ async def root():
                     const data = await res.json();
                     resp.className = data.success ? 'response success' : 'response error';
                     let badgeClass='badge-none', badgeText='No Data';
-                    if(data.source==='personal_knowledge'){badgeClass='badge-personal';badgeText='📚 Personal Knowledge';}
-                    else if(data.source==='general_knowledge'){badgeClass='badge-general';badgeText='🌍 General Knowledge';}
-                    resp.innerHTML = '<div class="source-badge '+badgeClass+'">'+badgeText+'</div><div style="margin-top:10px"><strong>Answer:</strong></div><div style="margin-top:10px">'+( data.answer||'No answer')+'</div>'+(data.confidence?'<div style="margin-top:10px;font-size:12px;color:#666">Confidence: '+(data.confidence*100).toFixed(1)+'%</div>':'')+( data.note?'<div style="margin-top:10px;font-size:12px;font-style:italic;color:#666">'+data.note+'</div>':'')+'';
+                    if(data.source==='personal_knowledge'){badgeClass='badge-personal';badgeText='Personal Knowledge';}
+                    else if(data.source==='web_search'){badgeClass='badge-general';badgeText='Live Web Search';}
+                    else if(data.source==='general_knowledge'){badgeClass='badge-general';badgeText='General Knowledge';}
+                    resp.innerHTML = '<div class="source-badge '+badgeClass+'">'+badgeText+'</div>'+(data.web_searched?'<div style="font-size:11px;color:#555;margin:2px 0">&#x1F310; Searched the web</div>':'')+
+                        '<div style="margin-top:10px"><strong>Answer:</strong></div><div style="margin-top:10px">'+(data.answer||'No answer')+'</div>'+
+                        (data.confidence?'<div style="margin-top:10px;font-size:12px;color:#666">Confidence: '+(data.confidence*100).toFixed(1)+'%</div>':'')+
+                        (data.note?'<div style="margin-top:10px;font-size:12px;font-style:italic;color:#666">'+data.note+'</div>':'');
                 } catch(e) { resp.className='response error'; resp.textContent='Error: '+e.message; }
             }
             async function forgetSpecific() {
@@ -571,17 +683,10 @@ async def root():
 # -------------------------------
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    return {"ok": True}
+    return {"ok": True, "service": "Personal AI Backend"}
 
-# -------------------------------
-# ✅ Healt# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 # 🗄️  DYNAMODB CHAT SYNC ENDPOINTS
-#
-# Table schema (your actual table — confirmed from ValidationException errors):
-#   PK   : pk      (String)  = "USER#rahul_personal_ai"
-#   SK   : sk      (String)  = "CONV#<id>"  |  "MSG#<conv_id>#<ts_padded>#<msg_id>"
-#   GSI  : gsi1pk  (String)  = "USER#rahul_personal_ai"
-#          gsi1sk  (Number)  = updatedAt timestamp — used for conv ordering
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/convs")
@@ -591,7 +696,7 @@ async def list_convs():
         resp  = _table().query(
             IndexName              = "gsi1",
             KeyConditionExpression = Key("gsi1pk").eq(USER_PK),
-            ScanIndexForward       = False,   # DESC — newest first
+            ScanIndexForward       = False,
         )
         convs = []
         for item in resp.get("Items", []):
@@ -602,7 +707,6 @@ async def list_convs():
                     "createdAt": int(item.get("createdAt", 0)),
                     "updatedAt": int(item.get("gsi1sk",    0)),
                 })
-        # Sort by updatedAt descending (gsi1sk stored as string, so sort in Python)
         convs.sort(key=lambda c: c["updatedAt"], reverse=True)
         return {"success": True, "conversations": convs}
     except Exception as e:
@@ -613,9 +717,7 @@ async def list_convs():
 async def get_conv(conv_id: str):
     """Get a single conversation by ID (used by the share page)."""
     try:
-        resp = _table().get_item(
-            Key={"pk": USER_PK, "sk": _conv_key(conv_id)}
-        )
+        resp = _table().get_item(Key={"pk": USER_PK, "sk": _conv_key(conv_id)})
         item = resp.get("Item")
         if not item:
             raise HTTPException(status_code=404, detail="Conversation not found")
@@ -634,21 +736,19 @@ async def get_conv(conv_id: str):
 
 @app.post("/conv")
 async def upsert_conv(body: ConvIn):
-    """Create or update a conversation.
-    If title is blank (touch-only call), only refresh the GSI sort key."""
+    """Create or update a conversation."""
     try:
         if body.title:
             _table().put_item(Item={
                 "pk"        : USER_PK,
                 "sk"        : _conv_key(body.id),
                 "gsi1pk"    : USER_PK,
-                "gsi1sk"    : str(body.updatedAt),  # stored as String — table GSI expects S type
+                "gsi1sk"    : str(body.updatedAt),
                 "convId"    : body.id,
                 "title"     : body.title,
                 "createdAt" : body.createdAt,
             })
         else:
-            # Touch only — update sort key without overwriting title
             _table().update_item(
                 Key={"pk": USER_PK, "sk": _conv_key(body.id)},
                 UpdateExpression="SET gsi1sk = :ts",
@@ -680,22 +780,18 @@ async def delete_conv(conv_id: str):
 
 @app.get("/msgs/{conv_id}")
 async def list_msgs(conv_id: str, since: Optional[int] = None):
-    """
-    List messages for a conversation, oldest-first.
-    ?since=<timestamp_ms> returns only messages newer than that time.
-    """
+    """List messages for a conversation, oldest-first."""
     try:
         resp  = _table().query(
             KeyConditionExpression=(
                 Key("pk").eq(USER_PK) &
                 Key("sk").begins_with(_msg_prefix(conv_id))
             ),
-            ScanIndexForward=True   # ASC — oldest first
+            ScanIndexForward=True
         )
         items = resp.get("Items", [])
         if since:
             items = [i for i in items if int(i.get("timestamp", 0)) > since]
-
         msgs = []
         for item in items:
             msgs.append({
@@ -735,7 +831,6 @@ async def upsert_msg(body: MsgIn):
             "editTotal"      : body.editTotal,
             "activeEditIndex": body.activeEditIndex,
         })
-        # Touch conversation so sidebar ordering stays current
         now = int(time.time() * 1000)
         _table().update_item(
             Key={"pk": USER_PK, "sk": _conv_key(body.conversationId)},
@@ -749,7 +844,7 @@ async def upsert_msg(body: MsgIn):
 
 @app.delete("/msg/{conv_id}/{msg_id}")
 async def delete_msg(conv_id: str, msg_id: str):
-    """Delete a specific message (queries prefix to find the full sort key)."""
+    """Delete a specific message."""
     try:
         resp = _table().query(
             KeyConditionExpression=(
@@ -764,6 +859,18 @@ async def delete_msg(conv_id: str, msg_id: str):
         return {"success": False, "error": "Message not found"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/search")
+async def search(q: str, wiki: bool = True):
+    """Standalone web search. GET /search?q=your+query"""
+    if not q:
+        return {"error": "Provide ?q= query param", "success": False}
+    try:
+        context = await web_search(q, include_wiki=wiki)
+        return {"success": True, "query": q, "context": context, "has_results": bool(context)}
+    except Exception as e:
+        return {"error": str(e), "success": False}
 
 
 @app.post("/generate_title")
@@ -784,13 +891,8 @@ Rules:
 - Examples: "Python list sorting help", "Travel plans Tokyo", "Recipe ideas pasta"
 
 Title:"""
-        response = co.chat(
-            model="command-r-plus-08-2024",
-            message=prompt,
-            temperature=0.3
-        )
+        response = co.chat(model="command-r-plus-08-2024", message=prompt, temperature=0.3)
         title = getattr(response, "text", "New Chat").strip().strip('"').strip("'")
-        # Truncate if too long
         if len(title) > 50:
             title = title[:47] + "..."
         return {"success": True, "title": title}
