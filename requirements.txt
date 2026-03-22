@@ -5,3 +5,4 @@ pinecone
 python-dotenv
 python-multipart
 requests
+boto3>=1.34.0
