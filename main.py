@@ -567,6 +567,13 @@ async def root():
     return html
 
 # -------------------------------
+# ✅ Health check
+# -------------------------------
+@app.api_route("/health", methods=["GET", "HEAD"])
+async def health():
+    return {"ok": True}
+
+# -------------------------------
 # ✅ Healt# ══════════════════════════════════════════════════════════════════════════════
 # 🗄️  DYNAMODB CHAT SYNC ENDPOINTS
 #
