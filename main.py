@@ -595,6 +595,8 @@ async def list_convs():
                     "createdAt": int(item.get("createdAt", 0)),
                     "updatedAt": int(item.get("gsi1sk",    0)),
                 })
+        # Sort by updatedAt descending (gsi1sk stored as string, so sort in Python)
+        convs.sort(key=lambda c: c["updatedAt"], reverse=True)
         return {"success": True, "conversations": convs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -633,7 +635,7 @@ async def upsert_conv(body: ConvIn):
                 "pk"        : USER_PK,
                 "sk"        : _conv_key(body.id),
                 "gsi1pk"    : USER_PK,
-                "gsi1sk"    : body.updatedAt,
+                "gsi1sk"    : str(body.updatedAt),  # stored as String — table GSI expects S type
                 "convId"    : body.id,
                 "title"     : body.title,
                 "createdAt" : body.createdAt,
@@ -643,7 +645,7 @@ async def upsert_conv(body: ConvIn):
             _table().update_item(
                 Key={"pk": USER_PK, "sk": _conv_key(body.id)},
                 UpdateExpression="SET gsi1sk = :ts",
-                ExpressionAttributeValues={":ts": body.updatedAt}
+                ExpressionAttributeValues={":ts": str(body.updatedAt)}
             )
         return {"success": True}
     except Exception as e:
@@ -731,7 +733,7 @@ async def upsert_msg(body: MsgIn):
         _table().update_item(
             Key={"pk": USER_PK, "sk": _conv_key(body.conversationId)},
             UpdateExpression="SET gsi1sk = :ts",
-            ExpressionAttributeValues={":ts": now}
+            ExpressionAttributeValues={":ts": str(now)}
         )
         return {"success": True}
     except Exception as e:
@@ -755,6 +757,38 @@ async def delete_msg(conv_id: str, msg_id: str):
         return {"success": False, "error": "Message not found"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/generate_title")
+async def generate_title(data: dict):
+    """Generate a short title for a conversation based on first user+AI messages."""
+    try:
+        user_text = data.get("user_text", "")
+        ai_text   = data.get("ai_text", "")
+        prompt = f"""Generate a short, descriptive title (max 5 words) for a conversation that starts with:
+
+User: {user_text[:200]}
+AI: {ai_text[:200]}
+
+Rules:
+- Max 5 words
+- No quotes, no punctuation at the end
+- Capture the main topic
+- Examples: "Python list sorting help", "Travel plans Tokyo", "Recipe ideas pasta"
+
+Title:"""
+        response = co.chat(
+            model="command-r-plus-08-2024",
+            message=prompt,
+            temperature=0.3
+        )
+        title = getattr(response, "text", "New Chat").strip().strip('"').strip("'")
+        # Truncate if too long
+        if len(title) > 50:
+            title = title[:47] + "..."
+        return {"success": True, "title": title}
+    except Exception as e:
+        return {"success": False, "title": "New Chat", "error": str(e)}
 
 
 # -------------------------------
