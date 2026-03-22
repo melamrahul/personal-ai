@@ -21,7 +21,7 @@ COHERE_API_KEY  = os.getenv("COHERE_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
 # DynamoDB — set these on Render dashboard (Environment tab)
-AWS_REGION   = os.getenv("AWS_REGION",   "us-east-1")
+AWS_REGION   = os.getenv("AWS_REGION",   "ap-south-1")
 DYNAMO_TABLE = os.getenv("DYNAMO_TABLE", "personal_ai_chat")
 USER_ID      = os.getenv("USER_ID",      "rahul_personal_ai")
 
@@ -633,17 +633,28 @@ async def get_conv(conv_id: str):
 
 @app.post("/conv")
 async def upsert_conv(body: ConvIn):
-    """Create or update a conversation."""
+    """Create or update a conversation.
+    If title is blank (touch-only call from touchConversation), only refresh
+    the GSI sort key so sidebar ordering stays current without overwriting the real title."""
     try:
-        _table().put_item(Item={
-            "userId"    : USER_ID,
-            "itemKey"   : _conv_key(body.id),
-            "gsi1pk"    : USER_ID,
-            "gsi1sk"    : body.updatedAt,
-            "convId"    : body.id,
-            "title"     : body.title,
-            "createdAt" : body.createdAt,
-        })
+        if body.title:
+            # Full create/update — write all fields
+            _table().put_item(Item={
+                "userId"    : USER_ID,
+                "itemKey"   : _conv_key(body.id),
+                "gsi1pk"    : USER_ID,
+                "gsi1sk"    : body.updatedAt,
+                "convId"    : body.id,
+                "title"     : body.title,
+                "createdAt" : body.createdAt,
+            })
+        else:
+            # Touch only — just update the updatedAt sort key
+            _table().update_item(
+                Key={"userId": USER_ID, "itemKey": _conv_key(body.id)},
+                UpdateExpression="SET gsi1sk = :ts",
+                ExpressionAttributeValues={":ts": body.updatedAt}
+            )
         return {"success": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
